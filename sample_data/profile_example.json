@@ -1,0 +1,14 @@
+{
+  "full_name": "Asha Example",
+  "date_of_birth": "1998-04-16",
+  "email": "asha@example.test",
+  "phone": "+91 90000 00000",
+  "address_line_1": "12 Example Road",
+  "city": "Coimbatore",
+  "state": "Tamil Nadu",
+  "postal_code": "641001",
+  "country": "India",
+  "education_level": "Bachelor's degree",
+  "institution": "Example University",
+  "graduation_year": "2020"
+}

@@ -1,0 +1,925 @@
+"""Playwright browser controls for Orqentra. Sensitive actions have separate methods."""
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import os
+import re
+from difflib import SequenceMatcher
+from urllib.parse import urlparse
+from typing import Any
+
+# Broad aliases for common fields across public services, education, employment,
+# travel, housing, membership, business and other web application workflows.
+ALIASES: dict[str, tuple[str, ...]] = {
+    "full_name": ("full name", "applicant name", "name of applicant", "candidate name", "legal name", "complete name", "name"),
+    "given_name": ("given name", "first name", "forename"),
+    "middle_name": ("middle name", "middle initial"),
+    "surname": ("surname", "last name", "family name"),
+    "date_of_birth": ("date of birth", "dob", "birth date", "birthday"),
+    "place_of_birth": ("place of birth", "birth place"),
+    "gender": ("gender", "sex"),
+    "nationality": ("nationality", "citizenship", "country of citizenship"),
+    "marital_status": ("marital status", "marriage status"),
+    "email": ("email", "email address", "e-mail", "contact email"),
+    "phone": ("mobile number", "phone number", "contact number", "telephone", "mobile", "cell number"),
+    "alternate_phone": ("alternate phone", "alternate mobile", "secondary phone"),
+    "address_line_1": ("address line 1", "address line one", "house number and street", "street address", "address", "residential address"),
+    "address_line_2": ("address line 2", "address line two", "apartment", "unit number"),
+    "city": ("city", "town", "village", "municipality"),
+    "district": ("district", "county"),
+    "state": ("state", "province", "region"),
+    "postal_code": ("postal code", "pin code", "pincode", "zip code", "postcode"),
+    "country": ("country", "country of residence"),
+    "permanent_address": ("permanent address", "home address"),
+    "current_address": ("current address", "present address", "residential address"),
+    "father_name": ("father name", "father's name", "name of father"),
+    "mother_name": ("mother name", "mother's name", "name of mother"),
+    "spouse_name": ("spouse name", "husband or wife name", "name of spouse"),
+    "emergency_contact_name": ("emergency contact name", "name of emergency contact"),
+    "emergency_contact_phone": ("emergency contact phone", "emergency contact number"),
+    "occupation": ("occupation", "profession", "job title", "current employment"),
+    "employer": ("employer", "company name", "organization name", "workplace"),
+    "employment_status": ("employment status", "work status"),
+    "annual_income": ("annual income", "yearly income", "income per annum", "annual household income"),
+    "tax_id": ("tax identification number", "tax id", "taxpayer identification"),
+    "national_id": ("national identification number", "national id", "identity number", "government id number"),
+    "guardian_name": ("guardian name", "parent or guardian", "name of guardian"),
+    "education_level": ("education level", "highest qualification", "highest education"),
+    "institution": ("institution", "school name", "college name", "university name", "educational institution"),
+    "course": ("course", "program", "programme", "degree", "study program"),
+    "field_of_study": ("field of study", "major", "subject", "specialization"),
+    "graduation_year": ("graduation year", "year of passing", "year completed"),
+    "years_experience": ("years of experience", "work experience", "experience in years"),
+    "previous_employer": ("previous employer", "previous company", "last employer"),
+    "current_salary": ("current salary", "present salary", "current ctc"),
+    "expected_salary": ("expected salary", "salary expectation", "expected ctc"),
+    "skills": ("skills", "key skills", "technical skills"),
+    "grade": ("grade", "cgpa", "gpa", "percentage", "marks"),
+    "application_id": ("application id", "application number", "reference number"),
+    "service_type": ("service type", "application type", "type of service"),
+    "purpose": ("purpose", "purpose of application", "reason for application"),
+    "organization": ("organization", "company", "business name", "institution name"),
+    "registration_number": ("registration number", "company registration number", "business registration number"),
+    "website": ("website", "website url", "web address"),
+    "accommodation_address": ("accommodation address", "hotel address", "place of stay"),
+    "accommodation_name": ("accommodation name", "hotel name", "place of stay name"),
+    "passport_number": ("passport number", "previous passport number", "existing passport number"),
+    "visa_type": ("visa type", "type of visa"),
+    "travel_purpose": ("travel purpose", "purpose of visit"),
+    "arrival_date": ("arrival date", "date of arrival"),
+    "departure_date": ("departure date", "date of departure"),
+}
+
+BLOCKED_WORDS = {
+    "password", "passcode", "otp", "one time password", "captcha", "verification code",
+    "security code", "payment", "card number", "cvv", "pin number", "login", "sign in",
+    "signature", "bank account", "account number", "routing number", "ifsc", "swift code",
+    "agree to terms", "terms and conditions", "declaration", "consent", "i agree",
+}
+ALLOWED_INPUT_TYPES = {"text", "email", "tel", "date", "number", "url", "search", "textarea", "select", "radio", "checkbox"}
+
+
+def _clean(value: str) -> str:
+    raw = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(value or ""))
+    return re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+
+
+def is_sensitive(label: str, input_type: str = "") -> bool:
+    haystack = f"{_clean(label)} {_clean(input_type)}"
+    return any(word in haystack for word in BLOCKED_WORDS)
+
+
+def allowed_host(url: str, allowlist: list[str]) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_global:
+            return False
+    except ValueError:
+        pass
+    if "*" in allowlist:
+        return True
+    for allowed in allowlist:
+        domain = allowed.strip().lower().lstrip(".").rstrip(".")
+        if domain and (host == domain or host.endswith("." + domain)):
+            return True
+    return False
+
+
+def _flatten_profile(profile: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
+    rows: list[tuple[str, Any]] = []
+    for key, value in profile.items():
+        full_key = f"{prefix}_{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            rows.extend(_flatten_profile(value, full_key))
+        elif value is not None:
+            rows.append((full_key, value))
+    return rows
+
+
+def _score_alias(searchable: str, alias: str) -> float:
+    a = _clean(alias)
+    if not a:
+        return 0.0
+    if searchable == a:
+        return 1.0
+    if a == "name" and searchable != "name":
+        return 0.0
+    if a in searchable:
+        return 0.96 if len(a.split()) > 1 else 0.89
+    ratio = SequenceMatcher(None, a, searchable).ratio()
+    return ratio * 0.9 if ratio >= 0.84 else 0.0
+
+
+def suggest_field_mappings(fields: list[dict[str, Any]], profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Suggest conservative mappings for ordinary form controls.
+
+    The background runtime auto-fills only high-confidence, non-sensitive matches.
+    The manual browser API can also return these suggestions for explicit approval.
+    Radio options are matched to the saved profile value; checkbox values require
+    an explicit boolean or selected value.
+    """
+    suggestions: list[dict[str, Any]] = []
+    used_keys: set[str] = set()
+    profile_items = _flatten_profile(profile)
+
+    # Process explicit option matches first so e.g. gender='Female' can map to
+    # the corresponding radio option rather than only matching the group label.
+    for field in fields:
+        input_type = str(field.get("type") or "text").lower()
+        if input_type not in {"radio", "checkbox"} or field.get("disabled") or field.get("readonly"):
+            continue
+        option = _clean(str(field.get("option_label") or field.get("label") or ""))
+        group = _clean(str(field.get("group_label") or ""))
+        if is_sensitive(f"{group} {option}", input_type):
+            continue
+        best = None
+        for key, value in profile_items:
+            if key in used_keys or is_sensitive(key):
+                continue
+            tail = key.split("_")[-1]
+            aliases = (key.replace("_", " "), tail.replace("_", " ")) + ALIASES.get(key, ()) + ALIASES.get(tail, ())
+            key_score = max((_score_alias(group, alias) for alias in aliases), default=0.0)
+            value_texts = [str(x) for x in value] if isinstance(value, list) else [str(value)]
+            value_match = max((1.0 for v in value_texts if _clean(v) == option and option), default=0.0)
+            if input_type == "radio" and value_match and key_score >= 0.35:
+                score = min(0.99, 0.90 + key_score * 0.09)
+                if best is None or score > best[0]:
+                    best = (score, key, "true")
+            elif input_type == "checkbox":
+                if isinstance(value, bool) and key_score >= 0.82 and _clean(key.replace("_", " ")) == option:
+                    best = (0.96, key, "true" if value else "false")
+                elif isinstance(value, list) and value_match and key_score >= 0.35:
+                    best = (0.96, key, "true")
+        if best:
+            used_keys.add(best[1])
+            suggestions.append({
+                "field_index": int(field["index"]), "field_label": str(field.get("label") or field.get("option_label") or f"Field {field['index'] + 1}"),
+                "input_type": input_type, "profile_key": best[1], "value": best[2], "confidence": round(best[0], 2),
+            })
+
+    for field in fields:
+        input_type = str(field.get("type") or "text").lower()
+        if input_type in {"radio", "checkbox"} or field.get("disabled") or field.get("readonly"):
+            continue
+        if input_type not in ALLOWED_INPUT_TYPES or is_sensitive(str(field.get("label") or ""), input_type):
+            continue
+        searchable = _clean(" ".join(str(field.get(k) or "") for k in ("label", "group_label", "name", "id", "placeholder", "autocomplete")))
+        best: tuple[float, str, Any] | None = None
+        for key, value in profile_items:
+            if key in used_keys or isinstance(value, (dict, list)) or is_sensitive(key):
+                continue
+            tail = key.split("_")[-1]
+            aliases = (key.replace("_", " "), tail.replace("_", " ")) + ALIASES.get(key, ()) + ALIASES.get(tail, ())
+            score = max((_score_alias(searchable, alias) for alias in aliases), default=0.0)
+            if best is None or score > best[0]:
+                best = (score, key, value)
+        if best and best[0] >= 0.82:
+            used_keys.add(best[1])
+            suggestions.append({
+                "field_index": int(field["index"]),
+                "field_label": str(field.get("label") or field.get("name") or field.get("id") or f"Field {field['index'] + 1}"),
+                "input_type": input_type, "profile_key": best[1], "value": str(best[2]), "confidence": round(best[0], 2),
+            })
+    return sorted(suggestions, key=lambda item: item["field_index"])
+
+
+class BrowserAutomationAgent:
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _allowlist() -> list[str]:
+        raw = os.getenv("ORQENTRA_ALLOWED_PORTAL_HOSTS", "*")
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    @classmethod
+    def config(cls) -> dict[str, Any]:
+        hosts = cls._allowlist()
+        return {"allowed_hosts": hosts, "allow_any_https_host": "*" in hosts,
+                "headless": os.getenv("ORQENTRA_HEADLESS", "false").lower() in {"1", "true", "yes"}}
+
+    async def open_portal(self, workflow_id: str, url: str) -> dict[str, Any]:
+        if not allowed_host(url, self._allowlist()):
+            raise ValueError("This HTTPS host is not allowed. Set ORQENTRA_ALLOWED_PORTAL_HOSTS=* for any HTTPS website, or add the exact host to the allow-list, then restart Orqentra.")
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            raise RuntimeError("Playwright is not installed. In the active virtual environment run: python -m pip install -r requirements.txt && python -m playwright install chromium") from exc
+
+        await self.close(workflow_id)
+        async with self._lock:
+            playwright = await async_playwright().start()
+            headless = self.config()["headless"]
+            browser = None
+            try:
+                browser = await playwright.chromium.launch(headless=headless)
+                context = await browser.new_context(viewport={"width": 1440, "height": 1000})
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                if not allowed_host(page.url, self._allowlist()):
+                    await context.close()
+                    await browser.close()
+                    raise ValueError("The site redirected to a host outside the allow-list. Add that login/identity-provider host and restart Orqentra.")
+                # Auto-dismiss announcement / ad modal popups immediately after page load
+                await page.wait_for_timeout(1000)
+                popup_dismissed = await self._dismiss_popups(page)
+                self._sessions[workflow_id] = {"playwright": playwright, "browser": browser, "context": context, "page": page}
+                return {"workflow_id": workflow_id, "url": page.url, "title": await page.title(), "headless": headless,
+                        "popup_dismissed": popup_dismissed,
+                        "message": "Website opened and announcement/ad popups dismissed."}
+            except Exception as exc:
+                if browser:
+                    try: await browser.close()
+                    except Exception: pass
+                try: await playwright.stop()
+                except Exception: pass
+                if isinstance(exc, ValueError):
+                    raise
+                detail = str(exc)
+                if "Executable doesn't exist" in detail or "browserType.launch" in detail:
+                    detail = "Chromium is not installed for this Python environment. Run: python -m playwright install chromium"
+                elif "Timeout" in detail or "timed out" in detail.lower():
+                    detail = "The site did not finish loading within 60 seconds. Check your internet connection, try the portal homepage, or use a less restrictive network."
+                elif "CERT" in detail or "SSL" in detail:
+                    detail = "The HTTPS certificate could not be verified. Check the computer date, network proxy, and portal URL. Orqentra will not bypass certificate errors."
+                raise RuntimeError(detail[:500]) from exc
+
+    def _page(self, workflow_id: str):
+        session = self._sessions.get(workflow_id)
+        if not session:
+            raise KeyError("No browser session. Open the website first.")
+        return session["page"]
+
+    async def _dismiss_popups(self, page) -> bool:
+        """Dismiss common cookie banners, alerts, advisories, announcements or modal popups."""
+        dismissed = False
+        try:
+            selectors = [
+                'button.btn-close', '.btn-close',
+                'button[aria-label*="close" i]', 'a[aria-label*="close" i]',
+                'button.close', '.modal .close', '#alertModal .close',
+                '[data-bs-dismiss="modal"]', '[data-dismiss="modal"]',
+                'button:has-text("✕")', 'button:has-text("×")', 'a:has-text("✕")', 'a:has-text("×")',
+                '.modal-header .close', '.modal-header button',
+                'button:has-text("Accept All")', 'button:has-text("I Agree")',
+                'button:has-text("Dismiss")', 'button:has-text("Close")',
+                'button:has-text("OK")'
+            ]
+            for sel in selectors:
+                elements = page.locator(sel)
+                count = await elements.count()
+                for i in range(min(count, 4)):
+                    item = elements.nth(i)
+                    if await item.is_visible():
+                        try:
+                            await item.click(timeout=1500)
+                            dismissed = True
+                            await page.wait_for_timeout(500)
+                            break
+                        except Exception:
+                            try:
+                                await item.evaluate("el => el.click()")
+                                dismissed = True
+                                await page.wait_for_timeout(500)
+                                break
+                            except Exception:
+                                pass
+                if dismissed:
+                    break
+
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+            await page.evaluate("""() => {
+                document.querySelectorAll('.modal-backdrop, .overlay-backdrop').forEach(el => el.remove());
+                document.querySelectorAll('.modal.show, .modal[style*="display: block"]').forEach(m => {
+                    const btn = m.querySelector('.btn-close, .close, [data-dismiss], [aria-label*="close" i]');
+                    if (btn) btn.click();
+                });
+            }""")
+        except Exception:
+            pass
+        return dismissed
+
+    async def take_screenshot(self, workflow_id: str) -> bytes:
+        """Capture screenshot of the current page."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            return await page.screenshot(type="jpeg", quality=60)
+
+    async def detect_page_actions(self, workflow_id: str) -> list[dict[str, Any]]:
+        """Detect available authentication and navigation choices on the landing page."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            await self._dismiss_popups(page)
+            actions = await page.evaluate("""() => {
+                const elements = Array.from(document.querySelectorAll('a, button, [role="button"], input[type=submit]'));
+                const found = [];
+                for (const el of elements) {
+                    const text = (el.innerText || el.textContent || el.value || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    if (/^(login|existing user|sign in|applicant login|citizen login)$/i.test(text)) {
+                        if (!found.some(f => f.action === 'login')) found.push({ label: 'Log In (Existing User)', action: 'login', text });
+                    } else if (/^(register|new user|sign up|new registration|create account)$/i.test(text)) {
+                        if (!found.some(f => f.action === 'register')) found.push({ label: 'Register (New User)', action: 'register', text });
+                    } else if (/^(apply for passport|apply online|apply now|start application|new application)$/i.test(text)) {
+                        if (!found.some(f => f.action === 'apply')) found.push({ label: text || 'Apply Online', action: 'apply', text });
+                    }
+                }
+                return found;
+            }""")
+            if not actions:
+                actions = [
+                    {"label": "Log In (Existing User)", "action": "login"},
+                    {"label": "Register (New User)", "action": "register"},
+                    {"label": "Apply Online / Start Form", "action": "apply"}
+                ]
+            return actions
+
+    async def navigate_action(self, workflow_id: str, action: str) -> dict[str, Any]:
+        """Navigate to the user-selected action on the portal."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            await self._dismiss_popups(page)
+
+            patterns = {
+                "login": r"^\s*(login|existing user|sign in|applicant login|citizen login)\s*$",
+                "register": r"^\s*(register|new user|sign up|new registration|create account)\s*$",
+                "signup": r"^\s*(register|new user|sign up|new registration|create account)\s*$",
+                "apply": r"^\s*(apply for passport|apply online|apply now|start application|new application)\s*$"
+            }
+            pattern = patterns.get(action.lower(), action)
+            navigated = False
+
+            # Check links with href first (bypasses target=_blank tab creation)
+            links = page.locator('a').filter(has_text=re.compile(pattern, re.I))
+            count = await links.count()
+            for i in range(count):
+                el = links.nth(i)
+                try:
+                    if await el.is_visible():
+                        href = await el.get_attribute("href")
+                        if href and not href.startswith("javascript:") and not href.startswith("#"):
+                            full_url = href if href.startswith("http") else urlparse(page.url)._replace(path=href).geturl()
+                            if allowed_host(full_url, self._allowlist()):
+                                await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                                await self._dismiss_popups(page)
+                                navigated = True
+                                break
+                        await el.click(timeout=4000)
+                        try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
+                        except Exception: pass
+                        await self._dismiss_popups(page)
+                        navigated = True
+                        break
+                except Exception:
+                    continue
+
+            if not navigated:
+                btns = page.locator('button, [role="button"], input[type="submit"]').filter(has_text=re.compile(pattern, re.I))
+                if await btns.count():
+                    target_btn = btns.first
+                    try:
+                        await target_btn.click(timeout=4000)
+                        try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
+                        except Exception: pass
+                        await self._dismiss_popups(page)
+                    except Exception:
+                        pass
+
+            has_pwd = await page.locator('input[type="password"]').count() > 0
+            body_text = (await page.locator("body").inner_text())[:6000].lower()
+            is_auth = has_pwd or bool(re.search(r"\b(user id|login id|enter password|username|create an account|registration form)\b", body_text))
+
+            return {
+                "action": action,
+                "url": page.url,
+                "title": await page.title(),
+                "next_step": "credentials" if (action in {"login", "register", "signup"} or is_auth) else "form"
+            }
+
+    async def perform_login(self, workflow_id: str, username: str, password: str, action: str = "login") -> dict[str, Any]:
+        """Automatically enter credentials into the portal in the background."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            await self._dismiss_popups(page)
+
+            # If action is login and password input is not on current page, click Login link/button
+            if action == "login" and await page.locator('input[type="password"]').count() == 0:
+                login_links = page.locator('a, button, [role="button"]')
+                for i in range(min(await login_links.count(), 30)):
+                    el = login_links.nth(i)
+                    try:
+                        txt = (await el.inner_text()).strip()
+                        if re.search(r"^\s*(login|sign in|existing user|citizen login|applicant login)\s*$", txt, re.I):
+                            if await el.is_visible():
+                                href = await el.get_attribute("href")
+                                if href and not href.startswith("javascript:") and not href.startswith("#"):
+                                    full_url = href if href.startswith("http") else urlparse(page.url)._replace(path=href).geturl()
+                                    if allowed_host(full_url, self._allowlist()):
+                                        await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                                        await self._dismiss_popups(page)
+                                        break
+                                await el.click(timeout=3000)
+                                try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
+                                except Exception: pass
+                                await self._dismiss_popups(page)
+                                break
+                    except Exception:
+                        continue
+
+            # If action is signup and password input is not on current page, click Register link/button
+            if action == "signup" and await page.locator('input[type="password"]').count() == 0:
+                reg_links = page.locator('a, button, [role="button"]')
+                for i in range(min(await reg_links.count(), 30)):
+                    el = reg_links.nth(i)
+                    try:
+                        txt = (await el.inner_text()).strip()
+                        if re.search(r"^\s*(register|sign up|new user|new registration|create account)\s*$", txt, re.I):
+                            if await el.is_visible():
+                                href = await el.get_attribute("href")
+                                if href and not href.startswith("javascript:") and not href.startswith("#"):
+                                    full_url = href if href.startswith("http") else urlparse(page.url)._replace(path=href).geturl()
+                                    if allowed_host(full_url, self._allowlist()):
+                                        await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                                        await self._dismiss_popups(page)
+                                        break
+                                await el.click(timeout=3000)
+                                try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
+                                except Exception: pass
+                                await self._dismiss_popups(page)
+                                break
+                    except Exception:
+                        continue
+
+            # Identify username or email input
+            user_input = None
+            selectors = [
+                'input[type="email"]',
+                'input[name*="user" i]', 'input[name*="login" i]', 'input[name*="email" i]', 'input[name*="id" i]',
+                'input[id*="user" i]', 'input[id*="login" i]', 'input[id*="email" i]', 'input[id*="id" i]',
+                'input[placeholder*="user" i]', 'input[placeholder*="email" i]', 'input[placeholder*="mobile" i]',
+                'input[type="text"]:not([readonly]):not([disabled])', 'input[type="tel"]'
+            ]
+            for sel in selectors:
+                candidates = page.locator(sel)
+                cnt = await candidates.count()
+                for i in range(cnt):
+                    c = candidates.nth(i)
+                    if await c.is_visible() and await c.is_enabled():
+                        user_input = c
+                        break
+                if user_input:
+                    break
+
+            # Identify password input
+            pwd_input = None
+            pwd_cands = page.locator('input[type="password"]')
+            for i in range(await pwd_cands.count()):
+                c = pwd_cands.nth(i)
+                if await c.is_visible() and await c.is_enabled():
+                    pwd_input = c
+                    break
+
+            if not user_input or not pwd_input:
+                return {"success": False, "reason": "Could not identify visible login username and password fields on the current portal page."}
+
+            await user_input.fill(username)
+            await pwd_input.fill(password)
+
+            # Check for CAPTCHA challenge
+            captcha = await page.evaluate("""() => {
+              const body = (document.body?.innerText || '').slice(0, 10000);
+              return !!document.querySelector('iframe[src*="recaptcha"], iframe[title*="challenge" i], .g-recaptcha, [data-sitekey]') ||
+                     /enter the captcha|security code shown above/i.test(body);
+            }""")
+            if captcha:
+                return {"success": False, "captcha_detected": True, "reason": "The portal requires a CAPTCHA. Please solve it in the browser window, then send ready."}
+
+            # Locate and click submit / login button
+            btn = None
+            for pattern in [r"^\s*(sign in|log in|login|submit|continue|proceed|register|create account)\s*$", r"login", r"sign in"]:
+                cands = page.get_by_role("button", name=re.compile(pattern, re.I))
+                if await cands.count():
+                    for i in range(await cands.count()):
+                        c = cands.nth(i)
+                        if await c.is_visible() and await c.is_enabled():
+                            btn = c
+                            break
+                    if btn:
+                        break
+
+            if not btn:
+                submits = page.locator('input[type="submit"], button[type="submit"]')
+                if await submits.count():
+                    for i in range(await submits.count()):
+                        c = submits.nth(i)
+                        if await c.is_visible() and await c.is_enabled():
+                            btn = c
+                            break
+
+            if btn:
+                try:
+                    await btn.scroll_into_view_if_needed(timeout=2000)
+                    await btn.click(timeout=5000)
+                except Exception:
+                    await btn.evaluate("el => el.click()")
+            else:
+                await pwd_input.press("Enter")
+
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+
+            body_after = (await page.locator("body").inner_text())[:4000].lower()
+            if re.search(r"invalid (username|password|credentials)|incorrect (username|password|credentials)|authentication failed|login failed", body_after):
+                return {"success": False, "reason": "The portal reported invalid credentials. Please check your username and password."}
+
+            return {"success": True, "url": page.url, "title": await page.title(), "message": "Credentials submitted to portal."}
+
+    async def navigate_to_application(self, workflow_id: str, goal: str = "application") -> dict[str, Any]:
+        """Try a conservative in-portal link discovery before asking the user to navigate."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            await self._dismiss_popups(page)
+            info = await page.locator("body").evaluate("""body => ({text:(body.innerText || '').slice(0,12000),
+              passwordCount:Array.from(document.querySelectorAll('input[type=password]')).filter(e => e.offsetWidth || e.offsetHeight || e.getClientRects().length).length,
+              visibleInputs:Array.from(document.querySelectorAll('input:not([type=hidden]),textarea,select')).filter(e => e.offsetWidth || e.offsetHeight || e.getClientRects().length).length})""")
+
+            auth_info = await page.locator("body").evaluate("""() => {
+                const links = Array.from(document.querySelectorAll('a, button, [role="button"], input[type=submit]'));
+                const hasLogin = links.some(el => {
+                    const txt = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+                    return /^(login|sign in|existing user|applicant login|citizen login)$/.test(txt);
+                });
+                const hasRegister = links.some(el => {
+                    const txt = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+                    return /^(register|sign up|new user|new registration|create account)$/.test(txt);
+                });
+                return { hasLogin, hasRegister };
+            }""")
+
+            if info["passwordCount"] or re.search(r"\b(sign in|log in|login to continue|user name and password)\b", info["text"], re.I) or auth_info.get("hasLogin"):
+                return {"found": False, "login_required": True, "has_form": info["passwordCount"] > 0, "has_login": auth_info.get("hasLogin", False), "has_register": auth_info.get("hasRegister", False), "url": page.url, "title": await page.title()}
+            links = await page.locator("a").evaluate_all("""els => els.map((el,index) => ({index,text:(el.innerText || el.getAttribute('aria-label') || '').trim(),href:el.href || ''})).filter(x => x.text && x.href)""")
+            goal_terms = [x for x in re.findall(r"[a-z]{4,}", goal.lower()) if x not in {"application", "apply", "portal", "official", "please", "complete", "submit", "online"}]
+            scored = []
+            for item in links:
+                label = item["text"].lower()
+                href = item["href"].lower()
+                if re.search(r"logout|log out|help|contact|privacy|terms|track status|download", label):
+                    continue
+                score = 0
+                if re.search(r"apply online|new application|start application|application form|apply now|start fresh", label):
+                    score += 7
+                elif re.search(r"existing user|user login|citizen login|applicant login|sign in|log in", label):
+                    score += 6
+                elif re.search(r"application|apply|admission|registration|register|enrol|enroll|start|renewal", label):
+                    score += 4
+                if any(term in label or term in href for term in goal_terms):
+                    score += 2
+                if urlparse(item["href"]).hostname == urlparse(page.url).hostname:
+                    score += 2
+                if score >= 4 and allowed_host(item["href"], self._allowlist()):
+                    scored.append((score, item))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            if scored:
+                target = scored[0][1]
+                # Navigate directly to an allow-listed HTTPS href so target=_blank does not
+                # silently create a second page that the runtime cannot observe.
+                await page.goto(target["href"], wait_until="domcontentloaded", timeout=45000)
+                if not allowed_host(page.url, self._allowlist()):
+                    raise ValueError("The application link redirected outside the configured host allow-list.")
+                is_auth_page = await page.locator("input[type=password]").count() > 0 or bool(re.search(r"\b(login|sign in|user id|enter password)\b", await page.locator("body").inner_text(), re.I))
+                return {"found": True, "login_required": is_auth_page, "has_form": is_auth_page, "url": page.url, "title": await page.title(), "link_text": target["text"]}
+            buttons = await page.locator("button,[role=button]").evaluate_all("""els => els.map((el,index) => ({index,text:(el.innerText || el.getAttribute('aria-label') || '').trim()})).filter(x => x.text)""")
+            button_candidates = [x for x in buttons if re.search(r"apply online|new application|start application|application form|apply now|continue application|user login|sign in|log in|register", x["text"], re.I)]
+            if button_candidates:
+                target_button = button_candidates[0]
+                await page.locator("button,[role=button]").nth(target_button["index"]).click()
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                if not allowed_host(page.url, self._allowlist()):
+                    raise ValueError("The application action navigated outside the configured host allow-list.")
+                return {"found": True, "login_required": False, "url": page.url, "title": await page.title(), "link_text": target_button["text"]}
+            page_title = await page.title()
+            if info["visibleInputs"] >= 2 and re.search(r"application|apply|admission|registration|scholarship|service", page_title + " " + info["text"], re.I):
+                return {"found": True, "login_required": False, "url": page.url, "title": page_title, "link_text": "Current page appears to contain a form"}
+            return {"found": False, "login_required": False, "url": page.url, "title": await page.title(), "reason": "No clear application entry link was found."}
+
+    async def inspect(self, workflow_id: str) -> dict[str, Any]:
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            await self._dismiss_popups(page)
+            fields = await page.locator('input:not([type="hidden"]), textarea, select').evaluate_all("""els => els.map((el, index) => {
+              const id = el.id || '';
+              const labels = id ? Array.from(document.querySelectorAll('label[for="' + CSS.escape(id) + '"]')).map(x => x.innerText) : [];
+              const parentLabel = el.closest('label')?.innerText || '';
+              const aria = el.getAttribute('aria-label') || '';
+              const labelled = el.getAttribute('aria-labelledby');
+              const labelledText = labelled ? (document.getElementById(labelled)?.innerText || '') : '';
+              const legend = el.closest('fieldset')?.querySelector('legend')?.innerText || '';
+              const tableHead = el.closest('tr')?.querySelector('th')?.innerText || '';
+              const optionLabel = [labels.join(' '), parentLabel].filter(Boolean).join(' ').trim();
+              const groupLabel = [legend, tableHead].filter(Boolean).join(' ').trim();
+              return {index, tag: el.tagName.toLowerCase(), type: (el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName)).toLowerCase(),
+                label: [optionLabel, aria, labelledText, groupLabel].filter(Boolean).join(' ').trim(),
+                option_label: optionLabel, group_label: groupLabel,
+                name: el.name || '', id, placeholder: el.getAttribute('placeholder') || '',
+                autocomplete: el.getAttribute('autocomplete') || '', required: !!el.required,
+                disabled: !!el.disabled || !(el.offsetWidth || el.offsetHeight || el.getClientRects().length), readonly: !!el.readOnly,
+                options: el.tagName === 'SELECT' ? Array.from(el.options).map(o => ({label:o.text, value:o.value})) : []};
+            })""")
+            for item in fields:
+                if not item["label"]:
+                    item["label"] = item.get("placeholder") or item.get("name") or item.get("id") or ""
+                item["sensitive"] = is_sensitive(item["label"], item["type"])
+            challenge = await page.evaluate("""() => {
+              const captcha = !!document.querySelector('iframe[src*="recaptcha"], iframe[title*="challenge" i], .g-recaptcha, [data-sitekey]');
+              const body = (document.body?.innerText || '').slice(0, 12000);
+              return {captcha, title:document.title || '', hasBiometric:/biometric|fingerprint|face recognition/i.test(body)};
+            }""")
+            return {"url": page.url, "title": await page.title(), "fields": fields, "challenge": challenge,
+                    "safe_field_count": sum(1 for f in fields if f["type"] in ALLOWED_INPUT_TYPES and not f["sensitive"] and not f["disabled"] and not f["readonly"])}
+
+    async def fill(self, workflow_id: str, approved_mappings: list[dict[str, Any]]) -> dict[str, Any]:
+        """Fill only user-approved mappings. Never triggers form submission."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            elements = page.locator('input:not([type="hidden"]), textarea, select')
+            count = await elements.count()
+            filled, skipped = [], []
+            seen_indexes: set[int] = set()
+            for mapping in approved_mappings:
+                try:
+                    index = int(mapping["field_index"])
+                    if index < 0 or index >= count:
+                        skipped.append({"field_index": index, "reason": "Field index is no longer present; inspect this page again."})
+                        continue
+                    if index in seen_indexes:
+                        skipped.append({"field_index": index, "reason": "Duplicate field mapping was ignored."})
+                        continue
+                    seen_indexes.add(index)
+                    locator = elements.nth(index)
+                    meta = await locator.evaluate("""el => ({type:(el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName)).toLowerCase(), tag:el.tagName.toLowerCase(),
+                      labels:el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '',
+                      name:el.name || '', id:el.id || '', placeholder:el.getAttribute('placeholder') || '',
+                      disabled:!!el.disabled, readonly:!!el.readOnly,
+                      group:el.closest('fieldset')?.querySelector('legend')?.innerText || ''})""")
+                    label = " ".join(str(meta.get(k) or "") for k in ("labels", "group", "name", "id", "placeholder"))
+                    expected_label = str(mapping.get("expected_label") or "")
+                    if expected_label and _clean(expected_label) not in _clean(label) and _clean(label) not in _clean(expected_label):
+                        skipped.append({"field_index": index, "reason": "Field label changed since inspection; inspect this page again."})
+                        continue
+                    if meta["disabled"] or meta["readonly"] or is_sensitive(label, meta["type"]) or meta["type"] not in ALLOWED_INPUT_TYPES:
+                        skipped.append({"field_index": index, "reason": "Field is protected or unsupported."})
+                        continue
+                    value = str(mapping.get("value", ""))
+                    if meta["type"] == "select":
+                        options = await locator.locator("option").evaluate_all("els => els.map(o => ({label:o.textContent.trim(), value:o.value}))")
+                        match = next((x for x in options if _clean(x["label"]) == _clean(value) or _clean(x["value"]) == _clean(value)), None)
+                        if match is None:
+                            skipped.append({"field_index": index, "reason": "No matching dropdown option; choose it manually."})
+                            continue
+                        await locator.select_option(value=match["value"])
+                    elif meta["type"] == "checkbox":
+                        if value.strip().lower() in {"true", "yes", "1", "checked"}:
+                            await locator.check()
+                        elif value.strip().lower() in {"false", "no", "0", "unchecked"}:
+                            await locator.uncheck()
+                        else:
+                            skipped.append({"field_index": index, "reason": "Checkbox requires an explicit true/false value."})
+                            continue
+                    elif meta["type"] == "radio":
+                        if value.strip().lower() not in {"true", "yes", "1", "checked"}:
+                            skipped.append({"field_index": index, "reason": "Radio option was not selected by the mapping."})
+                            continue
+                        await locator.check()
+                    else:
+                        await locator.fill(value)
+                    filled.append({"field_index": index, "field_label": label or f"Field {index + 1}", "profile_key": mapping.get("profile_key")})
+                except Exception as exc:
+                    skipped.append({"field_index": mapping.get("field_index"), "reason": str(exc)[:180]})
+            return {"filled": filled, "skipped": skipped,
+                    "message": "Approved fields populated only; the page was not submitted. Review every value in the open browser."}
+
+    async def upload_file(self, workflow_id: str, field_index: int, file_path: str) -> dict[str, Any]:
+        """Upload a user-provided document to a matching file input."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            elements = page.locator('input:not([type="hidden"]), textarea, select')
+            count = await elements.count()
+            if field_index < 0 or field_index >= count:
+                raise ValueError("The file field is no longer present. Inspect the page again.")
+            locator = elements.nth(field_index)
+            meta = await locator.evaluate("""el => ({type:(el.type || '').toLowerCase(), disabled:!!el.disabled,
+                labels:el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '',
+                aria:el.getAttribute('aria-label') || '', name:el.name || '', id:el.id || ''})""")
+            if meta.get("type") != "file" or meta.get("disabled"):
+                raise ValueError("Selected control is not an enabled file upload field.")
+            label = " ".join(str(meta.get(k) or "") for k in ("labels", "aria", "name", "id"))
+            if is_sensitive(label, "file"):
+                raise ValueError("This file field appears to be security-sensitive and was not auto-filled.")
+            await locator.set_input_files(file_path)
+            return {"uploaded": True, "field_index": field_index, "field_label": label or "Document upload"}
+
+    async def submit_otp(self, workflow_id: str, otp: str) -> dict[str, Any]:
+        """Enter an OTP only into a visibly labelled OTP field; do not persist the value."""
+        if not otp.isdigit() or not 4 <= len(otp) <= 12:
+            raise ValueError("Enter a numeric OTP containing 4 to 12 digits.")
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            matches = await page.locator('input:not([type="hidden"])').evaluate_all("""els => els.map((el,index) => {
+              const labels = el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '';
+              const text = [labels,el.getAttribute('aria-label'),el.getAttribute('placeholder'),el.name,el.id,
+                el.closest('label')?.innerText,el.closest('fieldset')?.querySelector('legend')?.innerText].filter(Boolean).join(' ');
+              return {index,text,disabled:!!el.disabled,visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)};
+            })""")
+            otp_field = next((x for x in matches if re.search(r"\b(otp|one.?time password|verification code|security code)\b", x["text"], re.I) and not x["disabled"] and x["visible"]), None)
+            if not otp_field:
+                raise ValueError("No visible OTP field was found. Inspect the current page and try again.")
+            locator = page.locator('input:not([type="hidden"])').nth(otp_field["index"])
+            await locator.fill(otp)
+            candidates = page.get_by_role("button", name=re.compile(r"^(verify|validate|confirm otp|verify otp|continue)$", re.I))
+            if await candidates.count():
+                await candidates.first.click()
+            else:
+                submits = page.locator('input[type="submit"], button[type="submit"]')
+                clicked = False
+                for i in range(await submits.count()):
+                    item = submits.nth(i)
+                    try:
+                        label = (await item.get_attribute("value")) or (await item.inner_text())
+                    except Exception:
+                        label = ""
+                    if re.search(r"verify|validate|otp|continue", label, re.I):
+                        await item.click()
+                        clicked = True
+                        break
+                if not clicked:
+                    raise ValueError("OTP was entered but no clearly labelled verification button was found. Please verify it in the browser.")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=12000)
+            except Exception:
+                pass
+            return {"accepted_for_submission": True, "url": page.url, "title": await page.title(),
+                    "message": "OTP entered into the labelled field. The code was not saved in chat, memory or logs."}
+
+    async def click_next(self, workflow_id: str) -> dict[str, Any]:
+        """Advance using only an unambiguous ordinary Next/Continue control with resilient click."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            await self._dismiss_popups(page)
+            candidates = page.get_by_role("button", name=re.compile(r"^\s*(next|continue|save and continue|proceed|save & next|next step)\s*$", re.I))
+            if not await candidates.count():
+                candidates = page.locator('input[type="submit"], input[type="button"]')
+            chosen = None
+            for i in range(await candidates.count()):
+                item = candidates.nth(i)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    label = (await item.get_attribute("value")) or (await item.inner_text())
+                    if re.fullmatch(r"\s*(next|continue|save and continue|proceed|save & next|next step)\s*", label or "", re.I):
+                        chosen = item
+                        break
+                except Exception:
+                    continue
+            if chosen is None:
+                return {"advanced": False, "reason": "No unambiguous Next or Continue button was found."}
+            try:
+                await chosen.scroll_into_view_if_needed(timeout=3000)
+                await chosen.click(timeout=6000)
+            except Exception:
+                try:
+                    await chosen.evaluate("el => el.click()")
+                except Exception as exc:
+                    return {"advanced": False, "reason": f"Could not click Next button: {str(exc)[:120]}"}
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=12000)
+            except Exception:
+                pass
+            return {"advanced": True, "url": page.url, "title": await page.title()}
+
+    async def submit_application(self, workflow_id: str, authorized: bool) -> dict[str, Any]:
+        """Submit only when authorized and no visible payment/declaration gate remains."""
+        if not authorized:
+            return {"submitted": False, "reason": "The original request did not clearly authorize final submission."}
+        async with self._lock:
+            page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
+            await self._dismiss_popups(page)
+            body_text = (await page.locator("body").inner_text())[:16000].lower()
+            if re.search(r"\b(payment due|pay now|make payment|payment gateway|transaction fee)\b", body_text):
+                return {"submitted": False, "reason": "The page requires payment. The user must review and complete payment."}
+            boxes = page.locator('input[type="checkbox"]')
+            for i in range(await boxes.count()):
+                item = boxes.nth(i)
+                try:
+                    label = await item.evaluate("el => (el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '') + ' ' + (el.closest('label')?.innerText || '') + ' ' + (el.closest('fieldset')?.innerText || '')")
+                    if re.search(r"declaration|consent|agree|terms|undertak|certify|accuracy of", label, re.I) and not await item.is_checked():
+                        return {"submitted": False, "reason": "A declaration, consent or terms checkbox needs the user's review."}
+                except Exception:
+                    continue
+            patterns = [r"^\s*submit application\s*$", r"^\s*submit form\s*$", r"^\s*apply now\s*$", r"^\s*submit\s*$"]
+            chosen = None
+            for pattern in patterns:
+                candidates = page.get_by_role("button", name=re.compile(pattern, re.I))
+                if await candidates.count():
+                    for i in range(await candidates.count()):
+                        c = candidates.nth(i)
+                        if await c.is_visible() and await c.is_enabled():
+                            chosen = c
+                            break
+                    if chosen:
+                        break
+            if chosen is None:
+                candidates = page.locator('input[type="submit"]')
+                for i in range(await candidates.count()):
+                    item = candidates.nth(i)
+                    if not await item.is_visible():
+                        continue
+                    label = (await item.get_attribute("value")) or ""
+                    if re.fullmatch(r"\s*(submit application|submit form|apply now|submit)\s*", label, re.I):
+                        chosen = item
+                        break
+            if chosen is None:
+                return {"submitted": False, "reason": "No clear final application submission control was found."}
+            try:
+                await chosen.scroll_into_view_if_needed(timeout=3000)
+                await chosen.click(timeout=6000)
+            except Exception:
+                try:
+                    await chosen.evaluate("el => el.click()")
+                except Exception as exc:
+                    return {"submitted": False, "reason": f"Could not click Submit button: {str(exc)[:120]}"}
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            text = (await page.locator("body").inner_text())[:8000]
+            return {"submitted": True, "url": page.url, "title": await page.title(), "confirmation_text": text[:1600],
+                    "message": "The final submission control was activated. Verify the portal's confirmation and acknowledgement."}
+
+    async def close(self, workflow_id: str) -> None:
+        async with self._lock:
+            session = self._sessions.pop(workflow_id, None)
+            if session:
+                for key in ("context", "browser"):
+                    try: await session[key].close()
+                    except Exception: pass
+                try: await session["playwright"].stop()
+                except Exception: pass
+
+    async def close_all(self) -> None:
+        for workflow_id in list(self._sessions):
+            await self.close(workflow_id)

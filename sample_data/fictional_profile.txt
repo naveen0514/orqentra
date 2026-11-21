@@ -1,0 +1,6 @@
+FICTIONAL DEMO PROFILE — NOT A REAL PERSON
+Name: Asha Example
+Date of birth: 1998-04-12
+Address: 10 Sample Street, Demo City
+Document number: SAMPLE-000-123
+Synthetic sample for testing text extraction only.
