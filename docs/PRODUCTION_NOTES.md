@@ -2,8 +2,8 @@
 
 Before using Orqentra with real personal or legally consequential applications:
 
-1. Add authentication and per-user data isolation. Current SQLite storage is single-user local mode.
-2. Encrypt sensitive fields and document storage at rest; add retention/deletion controls and backups.
+1. Harden the local account system for deployment with session revocation and production tenant isolation.
+2. Extend at-rest protection to original uploads and workflow records, and add retention, deletion, and backup controls.
 3. Replace in-process task scheduling with durable workers/checkpoints and recover browser sessions safely after restart.
 4. Restrict portal hosts; validate search sources and portal ownership. Avoid unrestricted production wildcard mode.
 5. Add portal-specific adapters and a supported-site test matrix. Generic DOM matching is not universal.

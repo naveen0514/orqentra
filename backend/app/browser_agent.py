@@ -6,7 +6,7 @@ import ipaddress
 import os
 import re
 from difflib import SequenceMatcher
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from typing import Any
 
 # Broad aliases for common fields across public services, education, employment,
@@ -21,7 +21,10 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "gender": ("gender", "sex"),
     "nationality": ("nationality", "citizenship", "country of citizenship"),
     "marital_status": ("marital status", "marriage status"),
-    "email": ("email", "email address", "e-mail", "contact email"),
+    "email": ("email", "email address", "email id", "e-mail", "e-mail id", "contact email"),
+    "login_id": ("login id", "user id", "username", "user name", "username or email", "user id or email"),
+    "login_id_same_as_email": ("do you want your login id to be same as e-mail id", "use email as login id"),
+    "registration_office": ("register to apply at",),
     "phone": ("mobile number", "phone number", "contact number", "telephone", "mobile", "cell number"),
     "alternate_phone": ("alternate phone", "alternate mobile", "secondary phone"),
     "address_line_1": ("address line 1", "address line one", "house number and street", "street address", "address", "residential address"),
@@ -73,11 +76,59 @@ ALIASES: dict[str, tuple[str, ...]] = {
 
 BLOCKED_WORDS = {
     "password", "passcode", "otp", "one time password", "captcha", "verification code",
-    "security code", "payment", "card number", "cvv", "pin number", "login", "sign in",
+    "security code", "characters shown in the image", "characters in the image",
+    "payment", "card number", "cvv", "pin number",
     "signature", "bank account", "account number", "routing number", "ifsc", "swift code",
     "agree to terms", "terms and conditions", "declaration", "consent", "i agree",
 }
 ALLOWED_INPUT_TYPES = {"text", "email", "tel", "date", "number", "url", "search", "textarea", "select", "radio", "checkbox"}
+FORM_CONTROLS = 'input:not([type="hidden"]), textarea, select'
+FIELD_METADATA = r"""(el, index) => {
+    const text = node => (node?.innerText || node?.textContent || '').trim();
+    const labels = Array.from(el.labels || []);
+    const ariaLabel = el.getAttribute('aria-label') || '';
+    const referenced = (el.getAttribute('aria-labelledby') || '').split(/\s+/)
+        .map(id => text(document.getElementById(id))).filter(Boolean).join(' ');
+    const type = el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName).toLowerCase();
+    const option = ['radio', 'checkbox'].includes(type);
+    const group = el.closest('[role="radiogroup"], [role="group"], fieldset');
+    const groupReference = (group?.getAttribute('aria-labelledby') || '').split(/\s+/)
+        .map(id => text(document.getElementById(id))).filter(Boolean).join(' ');
+    const adjacentLabel = node => node?.matches('label, .form-label') ? text(node) : '';
+    const nearbyLabel = adjacentLabel(el.previousElementSibling) ||
+        (el.parentElement?.querySelectorAll('input,select,textarea').length === 1 ?
+            adjacentLabel(el.parentElement.previousElementSibling) : '');
+    const optionLabel = labels.map(text).filter(Boolean).join(' ') || ariaLabel || referenced;
+    let radioLabel = '';
+    if (type === 'radio' && el.name) {
+        for (let parent = el.parentElement; parent && parent !== el.form; parent = parent.parentElement) {
+            const radios = Array.from(parent.querySelectorAll('input[type="radio"]'));
+            if (radios.length < 2) continue;
+            if (radios.every(radio => radio.name === el.name)) {
+                radioLabel = text(parent.querySelector('label:not([for]):not(:has(input)), .form-label')) ||
+                    adjacentLabel(parent.previousElementSibling);
+                if (radioLabel) break;
+            } else break;
+        }
+    }
+    const groupLabel = text(group?.querySelector('legend')) || group?.getAttribute('aria-label') ||
+        groupReference || text(el.closest('tr')?.querySelector('th')) || radioLabel || '';
+    const label = optionLabel || nearbyLabel || el.placeholder || el.name || el.id || '';
+    const displayed = !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+    const required = el.required || el.getAttribute('aria-required') === 'true' ||
+        group?.getAttribute('aria-required') === 'true' ||
+        ((option ? groupLabel + ' ' + label : label).includes('*'));
+    return {index, type, label: label.replace(/\s*\*\s*$/, '').trim(),
+        option_label: option ? (optionLabel || el.value) : '', group_label: groupLabel.replace(/\s*\*\s*$/, '').trim(),
+        name: el.name || '', id: el.id || '', placeholder: el.placeholder || '',
+        autocomplete: el.getAttribute('autocomplete') || '', required: !!required,
+        disabled: el.matches(':disabled') || !displayed, readonly: !!el.readOnly,
+        form_action: el.form?.action || '',
+        has_value: option ? el.checked : !!el.value,
+        valid: el.validity?.valid !== false && el.getAttribute('aria-invalid') !== 'true',
+        options: type === 'select' ? Array.from(el.options).filter(o => o.value && !o.disabled)
+            .map(o => ({label: o.text, value: o.value})) : []};
+}"""
 
 
 def _clean(value: str) -> str:
@@ -86,8 +137,22 @@ def _clean(value: str) -> str:
 
 
 def is_sensitive(label: str, input_type: str = "") -> bool:
-    haystack = f"{_clean(label)} {_clean(input_type)}"
-    return any(word in haystack for word in BLOCKED_WORDS)
+    haystack = f" {_clean(label)} {_clean(input_type)} "
+    return any(f" {word} " in haystack for word in BLOCKED_WORDS)
+
+
+def portal_origin(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return ""
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    return f"https://{host}" + (f":{parsed.port}" if parsed.port not in {None, 443} else "")
+
+
+def field_label(field: dict[str, Any]) -> str:
+    return str(field.get("label") or field.get("name") or field.get("id") or f"Field {int(field['index']) + 1}")
 
 
 def allowed_host(url: str, allowlist: list[str]) -> bool:
@@ -131,7 +196,7 @@ def _score_alias(searchable: str, alias: str) -> float:
         return 1.0
     if a == "name" and searchable != "name":
         return 0.0
-    if a in searchable:
+    if re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", searchable):
         return 0.96 if len(a.split()) > 1 else 0.89
     ratio = SequenceMatcher(None, a, searchable).ratio()
     return ratio * 0.9 if ratio >= 0.84 else 0.0
@@ -146,24 +211,28 @@ def suggest_field_mappings(fields: list[dict[str, Any]], profile: dict[str, Any]
     an explicit boolean or selected value.
     """
     suggestions: list[dict[str, Any]] = []
-    used_keys: set[str] = set()
-    profile_items = _flatten_profile(profile)
+    selected_groups: set[str] = set()
+    profile_items = [(key, value) for key, value in _flatten_profile(profile)
+                     if str(value).strip() not in {"", "[decryption error]"}]
 
     # Process explicit option matches first so e.g. gender='Female' can map to
     # the corresponding radio option rather than only matching the group label.
     for field in fields:
         input_type = str(field.get("type") or "text").lower()
-        if input_type not in {"radio", "checkbox"} or field.get("disabled") or field.get("readonly"):
+        if input_type not in {"radio", "checkbox"} or field.get("disabled") or field.get("readonly") or field.get("sensitive"):
             continue
         option = _clean(str(field.get("option_label") or field.get("label") or ""))
-        group = _clean(str(field.get("group_label") or ""))
+        group = _clean(str(field.get("group_label") or field.get("name") or ""))
+        group_key = str(field.get("name") or group or field["index"])
+        if input_type == "radio" and group_key in selected_groups:
+            continue
         if is_sensitive(f"{group} {option}", input_type):
             continue
         best = None
         for key, value in profile_items:
-            if key in used_keys or is_sensitive(key):
+            if is_sensitive(key):
                 continue
-            tail = key.split("_")[-1]
+            tail = key.split("_")[-1] if key not in ALIASES else key
             aliases = (key.replace("_", " "), tail.replace("_", " ")) + ALIASES.get(key, ()) + ALIASES.get(tail, ())
             key_score = max((_score_alias(group, alias) for alias in aliases), default=0.0)
             value_texts = [str(x) for x in value] if isinstance(value, list) else [str(value)]
@@ -178,7 +247,8 @@ def suggest_field_mappings(fields: list[dict[str, Any]], profile: dict[str, Any]
                 elif isinstance(value, list) and value_match and key_score >= 0.35:
                     best = (0.96, key, "true")
         if best:
-            used_keys.add(best[1])
+            if input_type == "radio":
+                selected_groups.add(group_key)
             suggestions.append({
                 "field_index": int(field["index"]), "field_label": str(field.get("label") or field.get("option_label") or f"Field {field['index'] + 1}"),
                 "input_type": input_type, "profile_key": best[1], "value": best[2], "confidence": round(best[0], 2),
@@ -188,20 +258,20 @@ def suggest_field_mappings(fields: list[dict[str, Any]], profile: dict[str, Any]
         input_type = str(field.get("type") or "text").lower()
         if input_type in {"radio", "checkbox"} or field.get("disabled") or field.get("readonly"):
             continue
-        if input_type not in ALLOWED_INPUT_TYPES or is_sensitive(str(field.get("label") or ""), input_type):
+        if input_type not in ALLOWED_INPUT_TYPES or field.get("sensitive") or is_sensitive(field_label(field), input_type):
             continue
-        searchable = _clean(" ".join(str(field.get(k) or "") for k in ("label", "group_label", "name", "id", "placeholder", "autocomplete")))
+        labels = [_clean(str(field.get(k) or "")) for k in ("label", "name", "id", "placeholder", "autocomplete")]
+        searchable = _clean(" ".join(labels))
         best: tuple[float, str, Any] | None = None
         for key, value in profile_items:
-            if key in used_keys or isinstance(value, (dict, list)) or is_sensitive(key):
+            if isinstance(value, (dict, list)) or is_sensitive(key):
                 continue
-            tail = key.split("_")[-1]
+            tail = key.split("_")[-1] if key not in ALIASES else key
             aliases = (key.replace("_", " "), tail.replace("_", " ")) + ALIASES.get(key, ()) + ALIASES.get(tail, ())
-            score = max((_score_alias(searchable, alias) for alias in aliases), default=0.0)
+            score = max((_score_alias(label, alias) for label in [*labels, searchable] for alias in aliases), default=0.0)
             if best is None or score > best[0]:
                 best = (score, key, value)
         if best and best[0] >= 0.82:
-            used_keys.add(best[1])
             suggestions.append({
                 "field_index": int(field["index"]),
                 "field_label": str(field.get("label") or field.get("name") or field.get("id") or f"Field {field['index'] + 1}"),
@@ -335,23 +405,24 @@ class BrowserAutomationAgent:
         """Capture screenshot of the current page."""
         async with self._lock:
             page = self._page(workflow_id)
-            return await page.screenshot(type="jpeg", quality=60)
+            passwords = page.locator('input[type="password"], input[autocomplete$="-password"], input[name*="password" i]')
+            return await page.screenshot(type="jpeg", quality=60, mask=[passwords])
 
     async def detect_page_actions(self, workflow_id: str) -> list[dict[str, Any]]:
         """Detect available authentication and navigation choices on the landing page."""
         async with self._lock:
             page = self._page(workflow_id)
             await self._dismiss_popups(page)
-            actions = await page.evaluate("""() => {
+            actions = await page.evaluate(r"""() => {
                 const elements = Array.from(document.querySelectorAll('a, button, [role="button"], input[type=submit]'));
                 const found = [];
                 for (const el of elements) {
                     const text = (el.innerText || el.textContent || el.value || '').trim();
                     const rect = el.getBoundingClientRect();
                     if (rect.width === 0 || rect.height === 0) continue;
-                    if (/^(login|existing user|sign in|applicant login|citizen login)$/i.test(text)) {
+                    if (/^(log ?in(?: \(existing user\))?|existing user|sign in|applicant login|citizen login)$/i.test(text)) {
                         if (!found.some(f => f.action === 'login')) found.push({ label: 'Log In (Existing User)', action: 'login', text });
-                    } else if (/^(register|new user|sign up|new registration|create account)$/i.test(text)) {
+                    } else if (/^(register(?: \(new user\))?|new user(?: registration)?|sign up|new registration|create account)$/i.test(text)) {
                         if (!found.some(f => f.action === 'register')) found.push({ label: 'Register (New User)', action: 'register', text });
                     } else if (/^(apply for passport|apply online|apply now|start application|new application)$/i.test(text)) {
                         if (!found.some(f => f.action === 'apply')) found.push({ label: text || 'Apply Online', action: 'apply', text });
@@ -359,12 +430,6 @@ class BrowserAutomationAgent:
                 }
                 return found;
             }""")
-            if not actions:
-                actions = [
-                    {"label": "Log In (Existing User)", "action": "login"},
-                    {"label": "Register (New User)", "action": "register"},
-                    {"label": "Apply Online / Start Form", "action": "apply"}
-                ]
             return actions
 
     async def navigate_action(self, workflow_id: str, action: str) -> dict[str, Any]:
@@ -374,9 +439,8 @@ class BrowserAutomationAgent:
             await self._dismiss_popups(page)
 
             patterns = {
-                "login": r"^\s*(login|existing user|sign in|applicant login|citizen login)\s*$",
-                "register": r"^\s*(register|new user|sign up|new registration|create account)\s*$",
-                "signup": r"^\s*(register|new user|sign up|new registration|create account)\s*$",
+                "login": r"^\s*(log ?in(?: \(existing user\))?|existing user|sign in|applicant login|citizen login)\s*$",
+                "register": r"^\s*(register(?: \(new user\))?|new user(?: registration)?|sign up|new registration|create account)\s*$",
                 "apply": r"^\s*(apply for passport|apply online|apply now|start application|new application)\s*$"
             }
             pattern = patterns.get(action.lower(), action)
@@ -391,12 +455,13 @@ class BrowserAutomationAgent:
                     if await el.is_visible():
                         href = await el.get_attribute("href")
                         if href and not href.startswith("javascript:") and not href.startswith("#"):
-                            full_url = href if href.startswith("http") else urlparse(page.url)._replace(path=href).geturl()
-                            if allowed_host(full_url, self._allowlist()):
-                                await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
-                                await self._dismiss_popups(page)
-                                navigated = True
-                                break
+                            full_url = urljoin(page.url, href)
+                            if not allowed_host(full_url, self._allowlist()):
+                                continue
+                            await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                            await self._dismiss_popups(page)
+                            navigated = True
+                            break
                         await el.click(timeout=4000)
                         try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
                         except Exception: pass
@@ -418,15 +483,11 @@ class BrowserAutomationAgent:
                     except Exception:
                         pass
 
-            has_pwd = await page.locator('input[type="password"]').count() > 0
-            body_text = (await page.locator("body").inner_text())[:6000].lower()
-            is_auth = has_pwd or bool(re.search(r"\b(user id|login id|enter password|username|create an account|registration form)\b", body_text))
-
             return {
                 "action": action,
                 "url": page.url,
                 "title": await page.title(),
-                "next_step": "credentials" if (action in {"login", "register", "signup"} or is_auth) else "form"
+                "next_step": "form",
             }
 
     async def perform_login(self, workflow_id: str, username: str, password: str, action: str = "login") -> dict[str, Any]:
@@ -597,6 +658,9 @@ class BrowserAutomationAgent:
 
             if info["passwordCount"] or re.search(r"\b(sign in|log in|login to continue|user name and password)\b", info["text"], re.I) or auth_info.get("hasLogin"):
                 return {"found": False, "login_required": True, "has_form": info["passwordCount"] > 0, "has_login": auth_info.get("hasLogin", False), "has_register": auth_info.get("hasRegister", False), "url": page.url, "title": await page.title()}
+            page_title = await page.title()
+            if info["visibleInputs"] >= 2 and re.search(r"application|apply|admission|registration|scholarship|service", page_title + " " + info["text"], re.I):
+                return {"found": True, "login_required": False, "has_form": True, "url": page.url, "title": page_title}
             links = await page.locator("a").evaluate_all("""els => els.map((el,index) => ({index,text:(el.innerText || el.getAttribute('aria-label') || '').trim(),href:el.href || ''})).filter(x => x.text && x.href)""")
             goal_terms = [x for x in re.findall(r"[a-z]{4,}", goal.lower()) if x not in {"application", "apply", "portal", "official", "please", "complete", "submit", "online"}]
             scored = []
@@ -640,9 +704,6 @@ class BrowserAutomationAgent:
                 if not allowed_host(page.url, self._allowlist()):
                     raise ValueError("The application action navigated outside the configured host allow-list.")
                 return {"found": True, "login_required": False, "url": page.url, "title": await page.title(), "link_text": target_button["text"]}
-            page_title = await page.title()
-            if info["visibleInputs"] >= 2 and re.search(r"application|apply|admission|registration|scholarship|service", page_title + " " + info["text"], re.I):
-                return {"found": True, "login_required": False, "url": page.url, "title": page_title, "link_text": "Current page appears to contain a form"}
             return {"found": False, "login_required": False, "url": page.url, "title": await page.title(), "reason": "No clear application entry link was found."}
 
     async def inspect(self, workflow_id: str) -> dict[str, Any]:
@@ -651,36 +712,55 @@ class BrowserAutomationAgent:
             if not allowed_host(page.url, self._allowlist()):
                 raise ValueError("Current page is outside the configured host allow-list.")
             await self._dismiss_popups(page)
-            fields = await page.locator('input:not([type="hidden"]), textarea, select').evaluate_all("""els => els.map((el, index) => {
-              const id = el.id || '';
-              const labels = id ? Array.from(document.querySelectorAll('label[for="' + CSS.escape(id) + '"]')).map(x => x.innerText) : [];
-              const parentLabel = el.closest('label')?.innerText || '';
-              const aria = el.getAttribute('aria-label') || '';
-              const labelled = el.getAttribute('aria-labelledby');
-              const labelledText = labelled ? (document.getElementById(labelled)?.innerText || '') : '';
-              const legend = el.closest('fieldset')?.querySelector('legend')?.innerText || '';
-              const tableHead = el.closest('tr')?.querySelector('th')?.innerText || '';
-              const optionLabel = [labels.join(' '), parentLabel].filter(Boolean).join(' ').trim();
-              const groupLabel = [legend, tableHead].filter(Boolean).join(' ').trim();
-              return {index, tag: el.tagName.toLowerCase(), type: (el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName)).toLowerCase(),
-                label: [optionLabel, aria, labelledText, groupLabel].filter(Boolean).join(' ').trim(),
-                option_label: optionLabel, group_label: groupLabel,
-                name: el.name || '', id, placeholder: el.getAttribute('placeholder') || '',
-                autocomplete: el.getAttribute('autocomplete') || '', required: !!el.required,
-                disabled: !!el.disabled || !(el.offsetWidth || el.offsetHeight || el.getClientRects().length), readonly: !!el.readOnly,
-                options: el.tagName === 'SELECT' ? Array.from(el.options).map(o => ({label:o.text, value:o.value})) : []};
-            })""")
+            fields = await page.locator(FORM_CONTROLS).evaluate_all(f"els => els.map({FIELD_METADATA})")
             for item in fields:
-                if not item["label"]:
-                    item["label"] = item.get("placeholder") or item.get("name") or item.get("id") or ""
-                item["sensitive"] = is_sensitive(item["label"], item["type"])
-            challenge = await page.evaluate("""() => {
-              const captcha = !!document.querySelector('iframe[src*="recaptcha"], iframe[title*="challenge" i], .g-recaptcha, [data-sitekey]');
+                item["sensitive"] = self._protected_field(item)
+            challenge = await page.evaluate(r"""() => {
+              const captcha = Array.from(document.querySelectorAll(
+                'iframe[src*="recaptcha"], iframe[title*="challenge" i], .g-recaptcha, [data-sitekey], img[alt*="captcha" i]'
+              )).some(el => el.getClientRects().length);
               const body = (document.body?.innerText || '').slice(0, 12000);
-              return {captcha, title:document.title || '', hasBiometric:/biometric|fingerprint|face recognition/i.test(body)};
+              return {captcha: captcha || /enter (?:the )?(?:captcha|characters (?:shown )?in the image)/i.test(body),
+                      hasBiometric: /biometric|fingerprint|face recognition/i.test(body),
+                      registrationConfirmed: /\b(registration (?:(?:is|was) )?successful|registration (?:was )?completed successfully|you have successfully registered|user (?:has been )?registered successfully)\b/i.test(body)};
             }""")
             return {"url": page.url, "title": await page.title(), "fields": fields, "challenge": challenge,
+                    "registration_confirmed": challenge["registrationConfirmed"],
                     "safe_field_count": sum(1 for f in fields if f["type"] in ALLOWED_INPUT_TYPES and not f["sensitive"] and not f["disabled"] and not f["readonly"])}
+
+    @staticmethod
+    def _protected_field(field: dict[str, Any]) -> bool:
+        label = " ".join(str(field.get(key) or "") for key in ("label", "group_label", "name", "id", "placeholder"))
+        return is_sensitive(label, field["type"])
+
+    @staticmethod
+    def _matches_mapping(page_url: str, field: dict[str, Any], mapping: dict[str, Any]) -> bool:
+        expected = mapping.get("expected_label")
+        if mapping.get("expected_url"):
+            return (page_url == mapping["expected_url"] and field["type"] == mapping["expected_type"]
+                    and field["id"] == mapping["field_id"] and field["name"] == mapping["field_name"]
+                    and field_label(field) == expected)
+        label = " ".join(str(field.get(key) or "") for key in ("label", "group_label", "name", "id", "placeholder"))
+        return not expected or bool(label and (_clean(expected) in _clean(label) or _clean(label) in _clean(expected)))
+
+    async def fill_password(self, workflow_id: str, mapping: dict[str, Any], password: str) -> bool:
+        """Fill a password only on the page and field shown in the current prompt."""
+        async with self._lock:
+            page = self._page(workflow_id)
+            origin = portal_origin(page.url)
+            if not origin or not allowed_host(page.url, self._allowlist()) or page.url != mapping["expected_url"]:
+                return False
+            locator = page.locator(FORM_CONTROLS).nth(mapping["field_index"])
+            try:
+                meta = await locator.evaluate(FIELD_METADATA, mapping["field_index"], timeout=2500)
+                if (meta["type"] != "password" or meta["disabled"] or meta["readonly"]
+                        or not self._matches_mapping(page.url, meta, mapping)
+                        or portal_origin(urljoin(page.url, meta["form_action"])) != origin):
+                    return False
+                await locator.fill(password, timeout=2500)
+                return await locator.evaluate("el => el.validity.valid && !!el.value", timeout=2500)
+            except Exception:
+                return False
 
     async def fill(self, workflow_id: str, approved_mappings: list[dict[str, Any]]) -> dict[str, Any]:
         """Fill only user-approved mappings. Never triggers form submission."""
@@ -688,7 +768,7 @@ class BrowserAutomationAgent:
             page = self._page(workflow_id)
             if not allowed_host(page.url, self._allowlist()):
                 raise ValueError("Current page is outside the configured host allow-list.")
-            elements = page.locator('input:not([type="hidden"]), textarea, select')
+            elements = page.locator(FORM_CONTROLS)
             count = await elements.count()
             filled, skipped = [], []
             seen_indexes: set[int] = set()
@@ -703,17 +783,12 @@ class BrowserAutomationAgent:
                         continue
                     seen_indexes.add(index)
                     locator = elements.nth(index)
-                    meta = await locator.evaluate("""el => ({type:(el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName)).toLowerCase(), tag:el.tagName.toLowerCase(),
-                      labels:el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '',
-                      name:el.name || '', id:el.id || '', placeholder:el.getAttribute('placeholder') || '',
-                      disabled:!!el.disabled, readonly:!!el.readOnly,
-                      group:el.closest('fieldset')?.querySelector('legend')?.innerText || ''})""")
-                    label = " ".join(str(meta.get(k) or "") for k in ("labels", "group", "name", "id", "placeholder"))
-                    expected_label = str(mapping.get("expected_label") or "")
-                    if expected_label and _clean(expected_label) not in _clean(label) and _clean(label) not in _clean(expected_label):
+                    meta = await locator.evaluate(FIELD_METADATA, index, timeout=2500)
+                    label = field_label(meta)
+                    if not self._matches_mapping(page.url, meta, mapping):
                         skipped.append({"field_index": index, "reason": "Field label changed since inspection; inspect this page again."})
                         continue
-                    if meta["disabled"] or meta["readonly"] or is_sensitive(label, meta["type"]) or meta["type"] not in ALLOWED_INPUT_TYPES:
+                    if meta["disabled"] or meta["readonly"] or self._protected_field(meta) or meta["type"] not in ALLOWED_INPUT_TYPES:
                         skipped.append({"field_index": index, "reason": "Field is protected or unsupported."})
                         continue
                     value = str(mapping.get("value", ""))
@@ -739,33 +814,35 @@ class BrowserAutomationAgent:
                         await locator.check()
                     else:
                         await locator.fill(value)
-                    filled.append({"field_index": index, "field_label": label or f"Field {index + 1}", "profile_key": mapping.get("profile_key")})
-                except Exception as exc:
-                    skipped.append({"field_index": mapping.get("field_index"), "reason": str(exc)[:180]})
+                    if await locator.evaluate("el => el.validity.valid && el.getAttribute('aria-invalid') !== 'true'", timeout=2500):
+                        filled.append({"field_index": index, "field_label": label, "profile_key": mapping.get("profile_key")})
+                    else:
+                        skipped.append({"field_index": index, "reason": "The portal rejected this value."})
+                except Exception:
+                    skipped.append({"field_index": mapping.get("field_index"), "reason": "The field could not be updated."})
             return {"filled": filled, "skipped": skipped,
                     "message": "Approved fields populated only; the page was not submitted. Review every value in the open browser."}
 
-    async def upload_file(self, workflow_id: str, field_index: int, file_path: str) -> dict[str, Any]:
+    async def upload_file(self, workflow_id: str, field_index: int, file_path: str, *, expected: dict | None = None) -> dict[str, Any]:
         """Upload a user-provided document to a matching file input."""
         async with self._lock:
             page = self._page(workflow_id)
             if not allowed_host(page.url, self._allowlist()):
                 raise ValueError("Current page is outside the configured host allow-list.")
-            elements = page.locator('input:not([type="hidden"]), textarea, select')
+            elements = page.locator(FORM_CONTROLS)
             count = await elements.count()
             if field_index < 0 or field_index >= count:
                 raise ValueError("The file field is no longer present. Inspect the page again.")
             locator = elements.nth(field_index)
-            meta = await locator.evaluate("""el => ({type:(el.type || '').toLowerCase(), disabled:!!el.disabled,
-                labels:el.labels ? Array.from(el.labels).map(x=>x.innerText).join(' ') : '',
-                aria:el.getAttribute('aria-label') || '', name:el.name || '', id:el.id || ''})""")
+            meta = await locator.evaluate(FIELD_METADATA, field_index, timeout=2500)
             if meta.get("type") != "file" or meta.get("disabled"):
                 raise ValueError("Selected control is not an enabled file upload field.")
-            label = " ".join(str(meta.get(k) or "") for k in ("labels", "aria", "name", "id"))
-            if is_sensitive(label, "file"):
+            if expected and not self._matches_mapping(page.url, meta, expected):
+                raise ValueError("The requested upload field changed.")
+            if self._protected_field(meta):
                 raise ValueError("This file field appears to be security-sensitive and was not auto-filled.")
-            await locator.set_input_files(file_path)
-            return {"uploaded": True, "field_index": field_index, "field_label": label or "Document upload"}
+            await locator.set_input_files(file_path, timeout=4000)
+            return {"uploaded": True, "field_index": field_index, "field_label": field_label(meta)}
 
     async def submit_otp(self, workflow_id: str, otp: str) -> dict[str, Any]:
         """Enter an OTP only into a visibly labelled OTP field; do not persist the value."""
@@ -781,7 +858,7 @@ class BrowserAutomationAgent:
                 el.closest('label')?.innerText,el.closest('fieldset')?.querySelector('legend')?.innerText].filter(Boolean).join(' ');
               return {index,text,disabled:!!el.disabled,visible:!!(el.offsetWidth||el.offsetHeight||el.getClientRects().length)};
             })""")
-            otp_field = next((x for x in matches if re.search(r"\b(otp|one.?time password|verification code|security code)\b", x["text"], re.I) and not x["disabled"] and x["visible"]), None)
+            otp_field = next((x for x in matches if re.search(r"\b(otp|one.?time password|verification code)\b", x["text"], re.I) and not x["disabled"] and x["visible"]), None)
             if not otp_field:
                 raise ValueError("No visible OTP field was found. Inspect the current page and try again.")
             locator = page.locator('input:not([type="hidden"])').nth(otp_field["index"])
@@ -811,14 +888,16 @@ class BrowserAutomationAgent:
             return {"accepted_for_submission": True, "url": page.url, "title": await page.title(),
                     "message": "OTP entered into the labelled field. The code was not saved in chat, memory or logs."}
 
-    async def click_next(self, workflow_id: str) -> dict[str, Any]:
+    async def click_next(self, workflow_id: str, *, login: bool = False) -> dict[str, Any]:
         """Advance using only an unambiguous ordinary Next/Continue control with resilient click."""
         async with self._lock:
             page = self._page(workflow_id)
             if not allowed_host(page.url, self._allowlist()):
                 raise ValueError("Current page is outside the configured host allow-list.")
             await self._dismiss_popups(page)
-            candidates = page.get_by_role("button", name=re.compile(r"^\s*(next|continue|save and continue|proceed|save & next|next step)\s*$", re.I))
+            names = r"log ?in|sign in" if login else r"next|continue|save and continue|proceed|save & next|next step"
+            pattern = re.compile(rf"^\s*(?:{names})\s*$", re.I)
+            candidates = page.get_by_role("button", name=pattern)
             if not await candidates.count():
                 candidates = page.locator('input[type="submit"], input[type="button"]')
             chosen = None
@@ -828,7 +907,7 @@ class BrowserAutomationAgent:
                     if not await item.is_visible():
                         continue
                     label = (await item.get_attribute("value")) or (await item.inner_text())
-                    if re.fullmatch(r"\s*(next|continue|save and continue|proceed|save & next|next step)\s*", label or "", re.I):
+                    if pattern.fullmatch(label or ""):
                         chosen = item
                         break
                 except Exception:
@@ -849,7 +928,7 @@ class BrowserAutomationAgent:
                 pass
             return {"advanced": True, "url": page.url, "title": await page.title()}
 
-    async def submit_application(self, workflow_id: str, authorized: bool) -> dict[str, Any]:
+    async def submit_application(self, workflow_id: str, authorized: bool, *, registration: bool = False) -> dict[str, Any]:
         """Submit only when authorized and no visible payment/declaration gate remains."""
         if not authorized:
             return {"submitted": False, "reason": "The original request did not clearly authorize final submission."}
@@ -870,7 +949,10 @@ class BrowserAutomationAgent:
                         return {"submitted": False, "reason": "A declaration, consent or terms checkbox needs the user's review."}
                 except Exception:
                     continue
-            patterns = [r"^\s*submit application\s*$", r"^\s*submit form\s*$", r"^\s*apply now\s*$", r"^\s*submit\s*$"]
+            names = ["register", "create account", "sign up", "submit"] if registration else [
+                "submit application", "submit form", "apply now", "submit",
+            ]
+            patterns = [rf"^\s*{name}\s*$" for name in names]
             chosen = None
             for pattern in patterns:
                 candidates = page.get_by_role("button", name=re.compile(pattern, re.I))
@@ -889,7 +971,7 @@ class BrowserAutomationAgent:
                     if not await item.is_visible():
                         continue
                     label = (await item.get_attribute("value")) or ""
-                    if re.fullmatch(r"\s*(submit application|submit form|apply now|submit)\s*", label, re.I):
+                    if label.strip().lower() in names:
                         chosen = item
                         break
             if chosen is None:

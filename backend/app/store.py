@@ -44,6 +44,13 @@ class Store:
                 UNIQUE(user_id, field_key)
             )""")
             con.execute("CREATE INDEX IF NOT EXISTS idx_profile_user ON user_profile(user_id)")
+            con.execute("""CREATE TABLE IF NOT EXISTS portal_values (
+                user_id TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                field_key TEXT NOT NULL,
+                encrypted_value TEXT NOT NULL,
+                PRIMARY KEY (user_id, origin, field_key)
+            )""")
 
             # ---- Encrypted user documents ----
             con.execute("""CREATE TABLE IF NOT EXISTS user_documents (
@@ -67,12 +74,11 @@ class Store:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id)")
             # Add user_id column if missing (migration from old schema)
-            try:
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(workflows)")}
+            if "user_id" not in columns:
                 con.execute("ALTER TABLE workflows ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            con.execute("CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id)")
 
             # ---- Events ----
             con.execute("""CREATE TABLE IF NOT EXISTS events (
@@ -209,6 +215,25 @@ class Store:
             rows = con.execute("SELECT field_key FROM user_profile WHERE user_id=? ORDER BY field_key", (user_id,)).fetchall()
         return [r["field_key"] for r in rows]
 
+    def save_portal_value(self, user_id: str, origin: str, key: str, value: str):
+        encrypted = encrypt_data(user_id, value)
+        with self.connect() as con:
+            con.execute("""INSERT INTO portal_values(user_id, origin, field_key, encrypted_value) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, origin, field_key) DO UPDATE SET encrypted_value=excluded.encrypted_value""",
+                (user_id, origin, key, encrypted))
+
+    def get_portal_values(self, user_id: str, origin: str, *, password: bool = False) -> dict[str, str]:
+        with self.connect() as con:
+            rows = con.execute("""SELECT field_key,encrypted_value FROM portal_values
+                WHERE user_id=? AND origin=? AND (field_key='password')=?""", (user_id, origin, password)).fetchall()
+        values = {}
+        for row in rows:
+            try:
+                values[row["field_key"]] = decrypt_data(user_id, row["encrypted_value"])
+            except Exception:
+                continue
+        return values
+
     # ===================== USER DOCUMENTS =====================
 
     def add_user_document(self, user_id: str, doc_name: str, doc_type: str, file_path: str, extracted_text: str = "", metadata: dict = None) -> str:
@@ -247,20 +272,32 @@ class Store:
             if old:
                 con.execute("UPDATE workflows SET data=?, updated_at=? WHERE id=?", (json.dumps(item), stamp, item["id"]))
             else:
-                con.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)", (item["id"], user_id, item["goal"], json.dumps(item), stamp, stamp))
+                con.execute("INSERT INTO workflows(id,user_id,goal,data,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+                            (item["id"], user_id, item["goal"], json.dumps(item), stamp, stamp))
 
-    def get_workflow(self, wid: str):
+    def get_workflow(self, wid: str, *, user_id: str | None = None):
         with self.connect() as con:
-            row = con.execute("SELECT data FROM workflows WHERE id=?", (wid,)).fetchone()
-        return json.loads(row["data"]) if row else None
+            if user_id is None:
+                row = con.execute("SELECT user_id,data FROM workflows WHERE id=?", (wid,)).fetchone()
+            else:
+                row = con.execute("SELECT user_id,data FROM workflows WHERE id=? AND user_id=?", (wid, user_id)).fetchone()
+        return self._load_workflow(row) if row else None
 
     def list_workflows(self, user_id: str = ""):
         with self.connect() as con:
             if user_id:
-                rows = con.execute("SELECT data FROM workflows WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (user_id,)).fetchall()
+                rows = con.execute("SELECT user_id,data FROM workflows WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (user_id,)).fetchall()
             else:
-                rows = con.execute("SELECT data FROM workflows ORDER BY created_at DESC LIMIT 50").fetchall()
-        return [json.loads(r["data"]) for r in rows]
+                rows = con.execute("SELECT user_id,data FROM workflows ORDER BY created_at DESC LIMIT 50").fetchall()
+        return [self._load_workflow(row) for row in rows]
+
+    @staticmethod
+    def _load_workflow(row: sqlite3.Row) -> dict:
+        workflow = json.loads(row["data"])
+        workflow["user_id"] = row["user_id"]
+        # Old workflows may contain search results from the installation-wide memory.
+        workflow.pop("retrieved_memory", None)
+        return workflow
 
     # ===================== EVENTS & MESSAGES =====================
 
@@ -319,14 +356,25 @@ class Store:
                                 (filename, chunk, json.dumps({"doc_id": doc_id, "workflow_id": workflow_id, "doc_type": doc_type}), now()))
 
     def list_documents(self):
-        with self.connect() as con:
-            rows = con.execute("SELECT id,workflow_id,filename,path,doc_type,created_at FROM documents ORDER BY created_at DESC").fetchall()
-        return [dict(r) for r in rows]
+        return self.get_documents(include_text=False)
 
-    def get_documents(self):
+    def get_documents(self, user_id: str = "", *, include_text: bool = True):
+        legacy_text = ", d.extracted_text" if include_text else ""
         with self.connect() as con:
-            rows = con.execute("SELECT id,workflow_id,filename,path,extracted_text,doc_type,created_at FROM documents ORDER BY created_at DESC").fetchall()
-        return [dict(r) for r in rows]
+            legacy_docs = con.execute(
+                f"""SELECT d.id,d.workflow_id,d.filename,d.path,d.doc_type,d.created_at{legacy_text}
+                    FROM documents d LEFT JOIN workflows w ON w.id=d.workflow_id
+                    WHERE COALESCE(w.user_id, '')=?""", (user_id,),
+            ).fetchall()
+        documents = [dict(row) for row in legacy_docs]
+        if user_id:
+            for row in self.get_user_documents(user_id):
+                document = {"id": row["id"], "workflow_id": None, "filename": row["doc_name"],
+                            "path": row["file_path"], "doc_type": row["doc_type"], "created_at": row["created_at"]}
+                if include_text:
+                    document["extracted_text"] = self.get_user_document_text(user_id, row["id"])
+                documents.append(document)
+        return sorted(documents, key=lambda doc: doc["created_at"], reverse=True)
 
     # ===================== RAG MEMORY SEARCH =====================
 
@@ -352,31 +400,17 @@ class Store:
         terms = expanded_terms
         hits: list[tuple[float, dict[str, Any]]] = []
 
-        # Search encrypted user profile if user_id provided
-        if user_id:
-            try:
-                user_profile = self.get_user_profile(user_id)
-                for key, value in user_profile.items():
-                    content = f"{key.replace('_', ' ')}: {value}"
-                    tokens = {t.lower() for t in re.findall(r"[a-zA-Z0-9]{3,}", content)}
-                    overlap = len(terms & tokens)
-                    if overlap > 0:
-                        score = (overlap / max(1, len(terms))) + 0.15  # Boost user-scoped data
-                        hits.append((score, {"source": "user profile", "content": content, "kind": "profile", "key": key}))
-            except Exception:
-                pass
-
-        # Legacy profile
-        profile = self.get_profile()
+        profile = self.get_user_profile(user_id) if user_id else self.get_profile()
+        profile_source = "user profile" if user_id else "saved profile"
         for key, value in profile.items():
             content = f"{key.replace('_', ' ')}: {value}"
             tokens = {t.lower() for t in re.findall(r"[a-zA-Z0-9]{3,}", content)}
             overlap = len(terms & tokens)
             if overlap > 0:
-                score = (overlap / max(1, len(terms))) + 0.1
-                hits.append((score, {"source": "saved profile", "content": content, "kind": "profile", "key": key}))
+                score = (overlap / max(1, len(terms))) + (0.15 if user_id else 0.1)
+                hits.append((score, {"source": profile_source, "content": content, "kind": "profile", "key": key}))
 
-        for doc in self.get_documents():
+        for doc in self.get_documents(user_id):
             content = doc["extracted_text"]
             tokens = {t.lower() for t in re.findall(r"[a-zA-Z0-9]{3,}", content[:12000])}
             overlap = len(terms & tokens)
@@ -387,7 +421,7 @@ class Store:
                 snippet = content[max(0, pos - 220):pos + 700]
                 hits.append((score, {"source": doc["filename"], "content": snippet, "kind": "document", "doc_id": doc["id"]}))
 
-        for row in self._get_chunks():
+        for row in self._get_chunks() if not user_id else ():
             tokens = {t.lower() for t in re.findall(r"[a-zA-Z0-9]{3,}", row["content"])}
             overlap = len(terms & tokens)
             if overlap > 0:
@@ -399,7 +433,9 @@ class Store:
 
     def _get_chunks(self):
         with self.connect() as con:
-            return [dict(r) for r in con.execute("SELECT source,content,metadata FROM knowledge_chunks ORDER BY id DESC LIMIT 200").fetchall()]
+            return [dict(r) for r in con.execute("""SELECT k.source,k.content,k.metadata FROM knowledge_chunks k
+                LEFT JOIN workflows w ON w.id=json_extract(k.metadata, '$.workflow_id')
+                WHERE COALESCE(w.user_id, '')='' ORDER BY k.id DESC LIMIT 200""").fetchall()]
 
     # ===================== OPTIMIZER =====================
 
@@ -409,12 +445,17 @@ class Store:
             con.execute("INSERT INTO run_history(workflow_id,goal,service,status,fields_filled,pages_visited,error_count,insights,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                         (workflow_id, goal, service, status, fields_filled, pages_visited, error_count, json.dumps(insights or {}), now()))
 
-    def get_run_insights(self, service: str, limit: int = 10) -> list[dict]:
+    def get_run_insights(self, service: str, limit: int = 10, *, user_id: str = "") -> list[dict]:
         with self.connect() as con:
-            rows = con.execute("SELECT goal,status,fields_filled,pages_visited,error_count,insights,created_at FROM run_history WHERE service=? ORDER BY id DESC LIMIT ?", (service, limit)).fetchall()
+            rows = con.execute("""SELECT r.goal,r.status,r.fields_filled,r.pages_visited,r.error_count,r.insights,r.created_at
+                FROM run_history r LEFT JOIN workflows w ON w.id=r.workflow_id
+                WHERE r.service=? AND COALESCE(w.user_id, '')=? ORDER BY r.id DESC LIMIT ?""",
+                (service, user_id, limit)).fetchall()
         return [dict(r) for r in rows]
 
-    def get_all_run_insights(self, limit: int = 20) -> list[dict]:
+    def get_all_run_insights(self, limit: int = 20, *, user_id: str = "") -> list[dict]:
         with self.connect() as con:
-            rows = con.execute("SELECT workflow_id,goal,service,status,fields_filled,pages_visited,error_count,created_at FROM run_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = con.execute("""SELECT r.workflow_id,r.goal,r.service,r.status,r.fields_filled,r.pages_visited,r.error_count,r.created_at
+                FROM run_history r LEFT JOIN workflows w ON w.id=r.workflow_id
+                WHERE COALESCE(w.user_id, '')=? ORDER BY r.id DESC LIMIT ?""", (user_id, limit)).fetchall()
         return [dict(r) for r in rows]

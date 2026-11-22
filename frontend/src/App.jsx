@@ -159,10 +159,88 @@ const ONBOARDING_STEPS = [
 ];
 
 
+function PortalScreenshot({ workflowId, token }) {
+  const [imageUrl, setImageUrl] = useState('');
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    let timer;
+
+    async function refresh() {
+      try {
+        const response = await fetch(`${API}/api/workflows/${workflowId}/screenshot`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal,
+        });
+        const image = response.ok ? await response.blob() : null;
+        if (!signal.aborted) setImageUrl(image ? URL.createObjectURL(image) : '');
+      } catch {
+        if (!signal.aborted) setImageUrl('');
+      } finally {
+        if (!signal.aborted) timer = setTimeout(refresh, 2500);
+      }
+    }
+
+    refresh();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [workflowId, token]);
+
+  useEffect(() => () => {
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+  }, [imageUrl]);
+
+  if (!imageUrl) return null;
+  return <div className="portal-screenshot-wrap"><img src={imageUrl} alt="Live portal" className="portal-screenshot" /></div>;
+}
+
+function PasswordPrompt({ question, busy, onAnswer }) {
+  const [password, setPassword] = useState('');
+  const [remember, setRemember] = useState(false);
+  return (
+    <form className="credentials-box" onSubmit={event => {
+      event.preventDefault();
+      if (!busy && password) onAnswer(question.id, password, remember);
+    }}>
+      <div className="credentials-title">
+        <Icon name="lock" />
+        <div><b>{question.label}</b><small>{question.portal}</small></div>
+      </div>
+      <div className="credentials-form">
+        <div className="credentials-row">
+          <input className="credentials-input" aria-label={question.label} placeholder="Portal password"
+            type="password" autoComplete="off" value={password} onChange={event => setPassword(event.target.value)}
+            maxLength={512} disabled={busy} required />
+          <button className="credentials-submit" disabled={busy || !password}>Fill password</button>
+        </div>
+        {question.remember && (
+          <label className="credentials-alt">
+            <input type="checkbox" checked={remember} onChange={event => setRemember(event.target.checked)} disabled={busy} />
+            {' '}Remember this password for this portal
+          </label>
+        )}
+      </div>
+    </form>
+  );
+}
+
 export default function App() {
+  const [session, setSession] = useState(() => ({ token: localStorage.getItem('orq_token') || '', user: null }));
+  const updateSession = useCallback((token, user = null) => {
+    if (token) localStorage.setItem('orq_token', token);
+    else localStorage.removeItem('orq_token');
+    setSession({ token, user });
+  }, []);
+
+  return <Workspace key={session.token} token={session.token} initialUser={session.user} updateSession={updateSession} />;
+}
+
+function Workspace({ token, initialUser, updateSession }) {
   // Auth state
-  const [token, setToken] = useState(() => localStorage.getItem('orq_token') || '');
-  const [currentUser, setCurrentUser] = useState(null);
+  const [currentUser, setCurrentUser] = useState(initialUser);
   const [authMode, setAuthMode] = useState('login'); // 'login' or 'register'
   const [authEmail, setAuthEmail] = useState('');
   const [authPass, setAuthPass] = useState('');
@@ -174,7 +252,7 @@ export default function App() {
   // Onboarding state
   const [onboardingPhase, setOnboardingPhase] = useState('upload'); // 'upload' (Step 0: Document Upload) or 'wizard' (Form Review)
   const [onboardingStep, setOnboardingStep] = useState(0);
-  const [onboardingData, setOnboardingData] = useState({});
+  const [onboardingData, setOnboardingData] = useState(() => initialUser ? { full_name: initialUser.full_name, email: initialUser.email } : {});
   const [onboardingSaving, setOnboardingSaving] = useState(false);
   const [uploadedDocs, setUploadedDocs] = useState([]);
   const [docUploading, setDocUploading] = useState(false);
@@ -188,11 +266,6 @@ export default function App() {
   const [recent, setRecent] = useState([]);
   const [text, setText] = useState('');
   const [otp, setOtp] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [actionType, setActionType] = useState('login');
-  const [showPassword, setShowPassword] = useState(false);
-  const [screenshotKey, setScreenshotKey] = useState(Date.now());
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -220,17 +293,17 @@ export default function App() {
 
   // ============= AUTH =============
   useEffect(() => {
-    if (!token) { setCurrentUser(null); return; }
-    request('/api/auth/me').then(u => {
+    if (!token) return;
+    const controller = new AbortController();
+    request('/api/auth/me', { signal: controller.signal }).then(u => {
+      if (controller.signal.aborted) return;
       setCurrentUser(u);
-      if (u.full_name) {
-        setOnboardingData(prev => ({ ...prev, full_name: u.full_name }));
-      }
+      setOnboardingData(prev => ({ full_name: u.full_name, email: u.email, ...prev }));
     }).catch(() => {
-      setToken('');
-      localStorage.removeItem('orq_token');
+      if (!controller.signal.aborted) updateSession('');
     });
-  }, [token, request]);
+    return () => controller.abort();
+  }, [token, request, updateSession]);
 
   async function handleAuth(e) {
     e.preventDefault(); setAuthBusy(true); setAuthError('');
@@ -240,29 +313,20 @@ export default function App() {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: authEmail, password: authPass, full_name: authName }),
         });
-        setToken(res.token); localStorage.setItem('orq_token', res.token);
-        setCurrentUser(res.user);
-        setOnboardingPhase('upload');
-        if (authName) {
-          setOnboardingData(prev => ({ ...prev, full_name: authName, email: authEmail }));
-        }
+        updateSession(res.token, res.user);
       } else {
         const res = await request('/api/auth/login', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: authEmail, password: authPass }),
         });
-        setToken(res.token); localStorage.setItem('orq_token', res.token);
-        setCurrentUser(res.user);
+        updateSession(res.token, res.user);
       }
     } catch (err) { setAuthError(err.message); }
     finally { setAuthBusy(false); }
   }
 
   function logout() {
-    setToken(''); setCurrentUser(null); setWorkflow(null); setMessages([]); setEvents([]);
-    localStorage.removeItem('orq_token');
-    setAuthEmail(''); setAuthPass(''); setAuthName(''); setPage('chat');
-    setOnboardingData({}); setUploadedDocs([]);
+    updateSession('');
   }
 
   // Pre-load user profile if in onboarding
@@ -368,7 +432,6 @@ export default function App() {
         request(`/api/workflows/${id}/activity`),
       ]);
       setWorkflow(wf); setMessages(msgs); setEvents(act);
-      setScreenshotKey(Date.now());
     } catch (err) { setError(err.message); }
   }, [request, workflow?.id]);
 
@@ -395,15 +458,15 @@ export default function App() {
 
   useEffect(() => { messagesEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }); }, [messages]);
 
-  async function sendMessage(event) {
+  async function sendMessage(event, reply = text) {
     event?.preventDefault();
-    const message = text.trim();
+    const message = reply.trim();
     if (!message || busy) return;
     setBusy(true); setError(''); setText('');
     try {
       const result = await request('/api/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, workflow_id: workflow?.id || null }),
+        body: JSON.stringify({ message, workflow_id: workflow?.id || null, reply_to: workflow?.pending_input?.id || null }),
       });
       setWorkflow(result.workflow);
       await refresh(result.workflow.id);
@@ -452,16 +515,15 @@ export default function App() {
     finally { setBusy(false); }
   }
 
-  async function sendCredentials(event) {
-    event?.preventDefault();
-    if (!username.trim() || !password.trim() || !workflow) return;
+  async function sendPassword(questionId, password, remember) {
+    if (!password || !workflow || busy) return;
     setBusy(true); setError('');
     try {
-      await request(`/api/workflows/${workflow.id}/credentials`, {
+      const result = await request(`/api/workflows/${workflow.id}/password`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username.trim(), password: password.trim(), action_type: actionType }),
+        body: JSON.stringify({ question_id: questionId, password, remember }),
       });
-      setUsername(''); setPassword('');
+      setWorkflow(result.workflow);
       await refresh(workflow.id);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
@@ -494,9 +556,10 @@ export default function App() {
   }
 
   async function selectWorkflow(id) { setError(''); setPage('chat'); await refresh(id); }
-  function newTask() { setWorkflow(null); setMessages([]); setEvents([]); setText(''); setError(''); setOtp(''); setUsername(''); setPassword(''); setAttached([]); setPage('chat'); }
+  function newTask() { setWorkflow(null); setMessages([]); setEvents([]); setText(''); setError(''); setOtp(''); setAttached([]); setPage('chat'); }
 
   const pending = workflow?.pending_input || null;
+  const chatUsesDedicatedControl = ['password', 'otp', 'credentials', 'login_ready', 'manual_verification', 'submit_registration'].includes(pending?.kind);
   const progressSteps = workflow?.plan || [];
   const doneCount = progressSteps.filter(s => s.status === 'completed').length;
   const currentState = workflow?.status || 'idle';
@@ -902,7 +965,10 @@ export default function App() {
                       {message.content.split(/\n/).map((line, li) => {
                         const urlMatch = line.match(/^\s*(\d+\.\s*)?\[([^\]]+)\]\((https:\/\/[^)]+)\)(.*)$/);
                         if (urlMatch) return <div className="portal-inline" key={li}><a href={urlMatch[3]} target="_blank" rel="noreferrer">{urlMatch[2]}</a><span>{urlMatch[4]}</span></div>;
-                        return <p key={li}>{line || '\u00a0'}</p>;
+                        return <p key={li}>{message.role === 'assistant'
+                          ? (line || '\u00a0').split(/(\*\*[^*]+\*\*)/).map((part, index) =>
+                            index % 2 ? <strong key={index}>{part.slice(2, -2)}</strong> : part)
+                          : line || '\u00a0'}</p>;
                       })}
                       <time>{formatTime(message.created_at)}</time>
                     </div>
@@ -937,25 +1003,17 @@ export default function App() {
               </div>
             )}
 
-            {pending?.kind === 'credentials' && (
-              <form className="credentials-box" onSubmit={sendCredentials}>
-                <div className="credentials-title"><Icon name="lock" /><div><b>{pending.action === 'signup' ? 'Portal Registration Required' : 'Portal Sign-in Required'}</b><small>Values are sent directly to the portal and are not stored in chat or memory.</small></div></div>
-                <div className="credentials-form">
-                  <div className="credentials-row">
-                    <input className="credentials-input" placeholder="Username / Email / Mobile" value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" />
-                    <input className="credentials-input" type={showPassword ? 'text' : 'password'} placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" />
-                    <button type="button" className="credentials-toggle" onClick={() => setShowPassword(!showPassword)}>{showPassword ? 'Hide' : 'Show'}</button>
-                  </div>
-                  <div className="credentials-actions">
-                    <div className="credentials-type-toggle">
-                      <button type="button" className={`type-btn ${actionType === 'login' ? 'active' : ''}`} onClick={() => setActionType('login')}>Login</button>
-                      <button type="button" className={`type-btn ${actionType === 'signup' ? 'active' : ''}`} onClick={() => setActionType('signup')}>Register</button>
-                    </div>
-                    <span className="credentials-alt">Or sign in in Chromium & reply <b>ready</b></span>
-                    <button type="submit" className="credentials-submit" disabled={busy || !username.trim() || !password.trim()}>{busy ? 'Authenticating…' : (actionType === 'signup' ? 'Submit Sign-up' : 'Submit Log-in')}</button>
-                  </div>
-                </div>
-              </form>
+            {pending?.kind === 'password' && (
+              <PasswordPrompt key={pending.id} question={pending} busy={busy} onAnswer={sendPassword} />
+            )}
+
+            {['credentials', 'login_ready', 'manual_verification', 'submit_registration'].includes(pending?.kind) && (
+              <div className="option-chips">
+                <button type="button" className="action-btn" disabled={busy}
+                  onClick={event => sendMessage(event, pending.kind === 'submit_registration' ? 'submit registration' : 'ready')}>
+                  {pending.kind === 'submit_registration' ? 'Submit registration' : 'Continue in chat'}
+                </button>
+              </div>
             )}
 
             {pending?.kind === 'approval' && (
@@ -978,14 +1036,22 @@ export default function App() {
             {pending?.kind === 'detail' && pending?.options?.length > 0 && (
               <div className="option-chips">
                 <span className="chips-label">Available options:</span>
-                {pending.options.map((opt, i) => <button key={i} type="button" className="option-chip" onClick={() => setText(opt)}>{opt}</button>)}
+                {pending.options.length > 8 ? (
+                  <select aria-label={pending.label} value="" disabled={busy} onChange={event => sendMessage(event, event.target.value)}>
+                    <option value="" disabled>Choose an option</option>
+                    {pending.options.map((option, index) => <option key={index} value={option}>{option}</option>)}
+                  </select>
+                ) : pending.options.map((option, index) => (
+                  <button key={index} type="button" className="option-chip" disabled={busy}
+                    onClick={event => sendMessage(event, option)}>{option}</button>
+                ))}
               </div>
             )}
 
-            <div className="composer-wrap">
+            {!chatUsesDedicatedControl && <div className="composer-wrap">
               {pending?.kind === 'document' && <div className="upload-prompt"><Icon name="file" /><span>Waiting for: <b>{pending.label}</b></span></div>}
               <form className="composer" onSubmit={sendMessage}>
-                <textarea value={text} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }} placeholder={workflow ? 'Reply to Orqentra…' : 'Describe the application you want to complete…'} rows={1} disabled={busy} />
+                <textarea value={text} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }} placeholder={pending?.kind === 'detail' ? `Enter ${pending.label}…` : workflow ? 'Reply to Orqentra…' : 'Describe the application you want to complete…'} rows={1} disabled={busy} />
                 <button className="send-button" disabled={busy || !text.trim()} aria-label="Send message"><Icon name="send" /></button>
               </form>
               <div className="composer-tools">
@@ -996,7 +1062,7 @@ export default function App() {
                 </div>
                 <span className="privacy-note">Your documents stay in the local Orqentra vault.</span>
               </div>
-            </div>
+            </div>}
           </section>
 
           <aside className="activity-panel">
@@ -1024,7 +1090,7 @@ export default function App() {
                     <div className="browser-card-title"><Icon name="globe"/> Current portal page</div>
                     <b>{workflow.current_page.title || 'Application portal'}</b>
                     <a href={workflow.current_page.url} target="_blank" rel="noreferrer">{workflow.current_page.url}</a>
-                    <div className="portal-screenshot-wrap"><img src={`${API}/api/workflows/${workflow.id}/screenshot?t=${screenshotKey}`} alt="Live portal" className="portal-screenshot" onError={e => { e.currentTarget.style.display = 'none'; }} onLoad={e => { e.currentTarget.style.display = 'block'; }} /></div>
+                    <PortalScreenshot key={workflow.id} workflowId={workflow.id} token={token} />
                     <small>{workflow.current_page.field_count} detected form controls</small>
                   </div>
                 )}

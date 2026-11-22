@@ -1,5 +1,5 @@
 from typing import Any
-from pydantic import BaseModel, Field, HttpUrl, EmailStr
+from pydantic import BaseModel, Field, HttpUrl, EmailStr, SecretStr
 
 
 # ---- Auth ----
@@ -25,6 +25,12 @@ class CreateWorkflowRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     workflow_id: str | None = None
+    reply_to: str | None = None
+
+class PasswordAnswerRequest(BaseModel):
+    question_id: str
+    password: SecretStr
+    remember: bool = False
 
 class OTPRequest(BaseModel):
     otp: str = Field(min_length=4, max_length=12)

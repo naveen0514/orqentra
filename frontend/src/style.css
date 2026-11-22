@@ -146,20 +146,17 @@ footer{height:42px;display:flex;justify-content:space-between;align-items:center
 .credentials-row{display:flex;gap:8px;align-items:center}
 .credentials-input{flex:1;min-width:0;border:1px solid #dce5f2;border-radius:7px;padding:8px 10px;font-size:12px;background:#fff;outline:none}
 .credentials-input:focus{border-color:#3b65a4}
-.credentials-actions{display:flex;justify-content:space-between;align-items:center;margin-top:4px;gap:8px;flex-wrap:wrap}
 .credentials-submit{border:0;border-radius:7px;background:#3b65a4;color:white;padding:8px 14px;font-size:11px;font-weight:600}
 .credentials-submit:hover{background:#2f538a}
-.credentials-toggle{background:#edf2f9;border:1px solid #dce5f2;border-radius:7px;color:#5572aa;font-size:10px;cursor:pointer;padding:8px 10px}
-.credentials-alt{font-size:10px;color:#889bb8}
-.credentials-type-toggle{display:flex;gap:4px;background:#e9f0f8;border-radius:6px;padding:2px}
-.type-btn{background:transparent;border:0;border-radius:5px;font-size:9px;padding:4px 8px;color:#677d9c;font-weight:600}
-.type-btn.active{background:white;color:#3b65a4;box-shadow:0 1px 3px rgba(0,0,0,0.08)}
+.credentials-alt{display:flex;align-items:center;gap:6px;font-size:11px;color:#536e97}
+.credentials-alt input{accent-color:#3b65a4}
 
 /* Option chips */
 .option-chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 18px 10px;align-items:center}
 .chips-label{font-size:10px;color:#687e79}
 .option-chip{background:#f0f7f5;border:1px solid #d2e7e0;color:#186c5e;border-radius:15px;padding:5px 11px;font-size:10px;cursor:pointer;font-weight:500}
 .option-chip:hover{background:#e3f2ee;border-color:#186c5e}
+.option-chips select{max-width:100%;padding:6px 9px;border:1px solid #d2e7e0;border-radius:7px;background:#f0f7f5;color:#186c5e;font:inherit;font-size:12px}
 
 /* Approval box */
 .approval-box{margin:0 18px 12px;border:1px solid #e1dceb;border-radius:11px;padding:12px;background:#faf8fc}

@@ -36,6 +36,8 @@ Orqentra is designed around the experience you described: the user gives one nat
 
 - Playwright opens the selected portal in Chromium.
 - For normal HTML forms, the agent inspects the current page and automatically fills high-confidence fields from saved applicant data.
+- Registration and sign-in forms use the same chat flow. The agent fills saved values, asks about one missing field at a time, and enters each answer in the portal.
+- Portal passwords use a masked chat input. The optional remember setting encrypts the password for reuse by the same Orqentra account on the same HTTPS origin.
 - It can attach a previously uploaded document to a matching required file field.
 - If a required value or document is missing, the agent asks in chat and resumes after the response or upload.
 - Clearly labelled Next/Continue controls can be followed automatically.
@@ -46,7 +48,7 @@ Orqentra is designed around the experience you described: the user gives one nat
 
 Some portal actions cannot safely or reliably be automated in a generic way:
 
-- Users must sign in directly on the official website; passwords should not be sent in chat.
+- Use the masked password input when the agent asks for a portal password. Orqentra account passwords are stored as hashes for local sign-in.
 - CAPTCHA, biometric checks, e-signatures, legal declarations/consents, and payments require direct user handling.
 - The agent pauses on protected fields or payment/declaration gates.
 - The agent never invents missing applicant facts. It asks the user instead.
@@ -142,21 +144,21 @@ Restart the backend. The adapter is only used as a fallback for explicitly label
 
 ## How to use
 
-1. Open Orqentra and type a request such as “Apply for a government scholarship using my saved documents and profile.”
+1. Open Orqentra, create or sign in to a local account, and finish onboarding. Then type a request such as “Apply for a government scholarship using my saved documents and profile.”
 2. Watch the Activity panel while the agent classifies the task, searches memory, and discovers a portal.
 3. For a known India portal, Orqentra opens it. For web-search candidates, select the portal from the chat.
-4. If the portal requires sign-in, complete it on the official website; navigate to the application page and type `ready` in chat.
+4. If the agent asks whether to sign in or register, choose the option in chat. The agent will open and fill the form.
 5. The agent inspects fields, fills confident matches, and attaches matching saved documents.
-6. If a required detail is missing, answer the chat question. If a document is missing, upload it in the chat composer. The workflow resumes automatically.
+6. Answer each missing field in chat, pick from the offered options, or upload the requested document. The agent enters the answer and checks for the next missing detail. When the agent pauses for CAPTCHA or biometric verification, complete it in the portal and choose **Continue in chat**.
 7. If the portal requests an OTP, enter it in the one-time OTP box shown in chat.
 8. When the portal is ready to submit, Orqentra activates a clearly labelled final submit control only if the original request explicitly authorized submission and no payment/declaration/consent gate remains. Review the official portal confirmation.
 
 ## Data and privacy
 
-- This prototype is intended for a **single local user**. It has no account system or multi-user isolation.
-- Applicant profile data, chat messages, workflow events, extracted document text, and uploaded files are stored under `backend/` on the computer running FastAPI.
-- Uploaded files are stored in `backend/uploads/`; SQLite data is stored in `backend/orqentra.db`.
-- OTP input is not stored in the chat, profile, or event log. Do not send passwords, recovery codes, payment-card data, or other secrets through chat.
+- The application runs locally. Sign-in keeps each account’s workflows, chat history, activity, browser previews, profile, and document vault scoped to that account.
+- SQLite data is stored in `backend/orqentra.db`. Profile values and text extracted into the account vault are encrypted. Original uploads are stored as files under `backend/uploads/`.
+- Workflows and documents with a recorded owner remain available to that account. Older records without an owner stay outside signed-in accounts.
+- Enter OTPs and portal passwords through their dedicated chat controls. A password is saved in the encrypted portal vault only when you select the remember option. Use the portal directly for recovery codes, payment details, and protected declarations.
 - Back up or remove the local database and upload folder deliberately. There is no cloud sync in this prototype.
 
 ## Tests
@@ -175,12 +177,12 @@ python -m pytest -q
 - `POST /api/workflows/{id}/documents` — upload a document and resume a document wait.
 - `POST /api/workflows/{id}/otp` — send a one-time code directly to the browser without persistence.
 - `POST /api/workflows/{id}/portal` — select a discovered HTTPS portal.
-- `GET /api/memory/profile` and `GET /api/memory/documents` — inspect locally saved applicant memory metadata.
+- `GET /api/profile` and `GET /api/user/documents` — inspect the signed-in account’s profile and document vault.
 
 ## Current prototype limitations
 
 - The portal registry is deliberately small; web search helps discover other portals but candidates need confirmation.
-- RAG retrieval is local lexical retrieval from saved profile values and document chunks. It is not yet a vector-embedding database.
+- RAG uses local lexical search over the signed-in account’s saved profile values and document text.
 - The first version uses deterministic field-label matching. Ambiguous or custom fields pause for user input instead of guessing.
 - The browser session is held in memory. A backend restart closes it; restart/reopen the portal and send `retry` or `ready` to continue.
 - A universal browser agent cannot guarantee completion of every portal. Site adapters are needed for non-standard components, dynamic grids, nested frames, and unusual workflows.
