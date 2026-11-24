@@ -209,6 +209,11 @@ def extract_profile_from_text(text: str, filename: str = "") -> dict[str, str]:
         if len(clean_addr) >= 10:
             fields["address_line_1"] = clean_addr[:150]
 
+    for key, label in (("post_office", r"post\s*office"), ("district", r"district")):
+        match = re.search(rf"(?im)^ *{label} *[:\-] *([^,;\r\n]+)", text)
+        if match:
+            fields[key] = match.group(1).strip()
+
     # 12. Education Fields
     degree_match = re.search(r"\b(B\.?Tech|M\.?Tech|B\.?E\.?|M\.?E\.?|B\.?Sc|M\.?Sc|B\.?Com|M\.?Com|B\.?A\.?|M\.?A\.?|BCA|MCA|MBA|BBA|Ph\.?D|Diploma|10th|12th|HSC|SSLC)\b", text, re.I)
     if degree_match:

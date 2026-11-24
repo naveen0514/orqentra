@@ -25,11 +25,12 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "login_id": ("login id", "user id", "username", "user name", "username or email", "user id or email"),
     "login_id_same_as_email": ("do you want your login id to be same as e-mail id", "use email as login id"),
     "registration_office": ("register to apply at",),
-    "phone": ("mobile number", "phone number", "contact number", "telephone", "mobile", "cell number"),
+    "phone": ("phone", "mobile number", "phone number", "contact number", "telephone", "mobile", "cell number"),
     "alternate_phone": ("alternate phone", "alternate mobile", "secondary phone"),
     "address_line_1": ("address line 1", "address line one", "house number and street", "street address", "address", "residential address"),
     "address_line_2": ("address line 2", "address line two", "apartment", "unit number"),
     "city": ("city", "town", "village", "municipality"),
+    "post_office": ("post office", "postal office"),
     "district": ("district", "county"),
     "state": ("state", "province", "region"),
     "postal_code": ("postal code", "pin code", "pincode", "zip code", "postcode"),
@@ -51,7 +52,7 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "education_level": ("education level", "highest qualification", "highest education"),
     "institution": ("institution", "school name", "college name", "university name", "educational institution"),
     "course": ("course", "program", "programme", "degree", "study program"),
-    "field_of_study": ("field of study", "major", "subject", "specialization"),
+    "field_of_study": ("field of study", "major", "subject", "subjects", "specialization"),
     "graduation_year": ("graduation year", "year of passing", "year completed"),
     "years_experience": ("years of experience", "work experience", "experience in years"),
     "previous_employer": ("previous employer", "previous company", "last employer"),
@@ -113,7 +114,20 @@ FIELD_METADATA = r"""(el, index) => {
     }
     const groupLabel = text(group?.querySelector('legend')) || group?.getAttribute('aria-label') ||
         groupReference || text(el.closest('tr')?.querySelector('th')) || radioLabel || '';
-    const label = optionLabel || nearbyLabel || el.placeholder || el.name || el.id || '';
+    const comboControl = el.closest('[class*="-control"]');
+    const combo = el.getAttribute('role') === 'combobox' && comboControl;
+    const comboLabel = (/^(state|city)$/i.test(comboControl?.parentElement?.id || '') ? comboControl.parentElement.id : '') ||
+        (/^subjectsInput$/i.test(el.id) ? 'Subjects' : '') ||
+        text(comboControl?.querySelector('[class*="-placeholder"]'));
+    const label = optionLabel || nearbyLabel || comboLabel || el.placeholder || el.name || el.id || '';
+    const birthPicker = type === 'text' && !!el.closest('.react-datepicker-wrapper') &&
+        /date[ _-]*of[ _-]*birth|\bdob\b/i.test(label + ' ' + el.id);
+    const dateDefault = birthPicker && el.value === el.defaultValue &&
+        new Date(el.value).toDateString() === new Date().toDateString();
+    const digitHint = (label + ' ' + el.placeholder).match(/\b(\d{1,2})[ -]*digits?\b/i);
+    const patternLength = (el.getAttribute('pattern') || '').match(/^\^?(?:\\d|\[0-9\])\{(\d{1,2})\}\$?$/);
+    const phone = type === 'tel' || /\b(mobile|phone|telephone|contact number)\b/i.test(label);
+    const digits = phone ? Number(digitHint?.[1] || patternLength?.[1] || (el.maxLength === 10 ? 10 : 0)) : 0;
     const displayed = !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
     const required = el.required || el.getAttribute('aria-required') === 'true' ||
         group?.getAttribute('aria-required') === 'true' ||
@@ -124,8 +138,12 @@ FIELD_METADATA = r"""(el, index) => {
         autocomplete: el.getAttribute('autocomplete') || '', required: !!required,
         disabled: el.matches(':disabled') || !displayed, readonly: !!el.readOnly,
         form_action: el.form?.action || '',
-        has_value: option ? el.checked : !!el.value,
-        valid: el.validity?.valid !== false && el.getAttribute('aria-invalid') !== 'true',
+        digits, combo: !!combo, birth_picker: birthPicker,
+        has_value: option ? el.checked : combo ?
+            !!comboControl.querySelector('[class*="-singleValue"], [class*="-multiValue"], [class*="-multi-value"], [role="button"][aria-label^="Remove"]') :
+            !!el.value && !dateDefault,
+        valid: el.validity?.valid !== false && el.getAttribute('aria-invalid') !== 'true' &&
+            (!digits || new RegExp('^\\d{' + digits + '}$').test(el.value)),
         options: type === 'select' ? Array.from(el.options).filter(o => o.value && !o.disabled)
             .map(o => ({label: o.text, value: o.value})) : []};
 }"""
@@ -349,56 +367,43 @@ class BrowserAutomationAgent:
         return session["page"]
 
     async def _dismiss_popups(self, page) -> bool:
-        """Dismiss common cookie banners, alerts, advisories, announcements or modal popups."""
+        """Close visible announcements and ads using their own dismiss controls."""
+        overlays = page.locator(
+            '.modal:visible, dialog:visible, [role="dialog"]:visible, '
+            '[aria-modal="true"]:visible, .advertisement-popup:visible, '
+            '.ad-popup:visible, .announcement-popup:visible'
+        )
+        close_controls = (
+            'button.btn-close, button.close, a.close, [data-bs-dismiss="modal"], '
+            '[data-dismiss="modal"], [aria-label="close" i], '
+            '[aria-label="close advertisement" i], [title="close" i]'
+        )
+        close_label = re.compile(r"^\s*(?:close(?: ad(?:vertisement)?)?|dismiss|skip ad|no thanks|[×✕✖])\s*$", re.I)
         dismissed = False
-        try:
-            selectors = [
-                'button.btn-close', '.btn-close',
-                'button[aria-label*="close" i]', 'a[aria-label*="close" i]',
-                'button.close', '.modal .close', '#alertModal .close',
-                '[data-bs-dismiss="modal"]', '[data-dismiss="modal"]',
-                'button:has-text("✕")', 'button:has-text("×")', 'a:has-text("✕")', 'a:has-text("×")',
-                '.modal-header .close', '.modal-header button',
-                'button:has-text("Accept All")', 'button:has-text("I Agree")',
-                'button:has-text("Dismiss")', 'button:has-text("Close")',
-                'button:has-text("OK")'
-            ]
-            for sel in selectors:
-                elements = page.locator(sel)
-                count = await elements.count()
-                for i in range(min(count, 4)):
-                    item = elements.nth(i)
-                    if await item.is_visible():
-                        try:
-                            await item.click(timeout=1500)
-                            dismissed = True
-                            await page.wait_for_timeout(500)
-                            break
-                        except Exception:
-                            try:
-                                await item.evaluate("el => el.click()")
-                                dismissed = True
-                                await page.wait_for_timeout(500)
-                                break
-                            except Exception:
-                                pass
-                if dismissed:
+        for _ in range(3):
+            closed = False
+            for overlay in await overlays.all():
+                if not await overlay.is_visible():
+                    continue
+                text = await overlay.inner_text(timeout=1000)
+                if re.search(r"\b(consent|declaration|terms and conditions|payment|captcha)\b", text, re.I):
+                    continue
+                if await overlay.locator('input:not([type="hidden"]):visible, select:visible, textarea:visible').count():
+                    continue
+                controls = overlay.locator(close_controls).or_(
+                    overlay.get_by_role("button", name=close_label)
+                ).or_(overlay.get_by_role("link", name=close_label))
+                for control in await controls.all():
+                    try:
+                        await control.click(timeout=1000)
+                    except Exception:
+                        continue
+                    dismissed = closed = True
                     break
-
-            try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-
-            await page.evaluate("""() => {
-                document.querySelectorAll('.modal-backdrop, .overlay-backdrop').forEach(el => el.remove());
-                document.querySelectorAll('.modal.show, .modal[style*="display: block"]').forEach(m => {
-                    const btn = m.querySelector('.btn-close, .close, [data-dismiss], [aria-label*="close" i]');
-                    if (btn) btn.click();
-                });
-            }""")
-        except Exception:
-            pass
+                if closed:
+                    break
+            if not closed:
+                break
         return dismissed
 
     async def take_screenshot(self, workflow_id: str) -> bytes:
@@ -436,6 +441,8 @@ class BrowserAutomationAgent:
         """Navigate to the user-selected action on the portal."""
         async with self._lock:
             page = self._page(workflow_id)
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("Current page is outside the configured host allow-list.")
             await self._dismiss_popups(page)
 
             patterns = {
@@ -459,6 +466,8 @@ class BrowserAutomationAgent:
                             if not allowed_host(full_url, self._allowlist()):
                                 continue
                             await page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                            if not allowed_host(page.url, self._allowlist()):
+                                raise ValueError("The portal action redirected outside the configured host allow-list.")
                             await self._dismiss_popups(page)
                             navigated = True
                             break
@@ -472,22 +481,23 @@ class BrowserAutomationAgent:
                     continue
 
             if not navigated:
-                btns = page.locator('button, [role="button"], input[type="submit"]').filter(has_text=re.compile(pattern, re.I))
-                if await btns.count():
-                    target_btn = btns.first
-                    try:
-                        await target_btn.click(timeout=4000)
-                        try: await page.wait_for_load_state("domcontentloaded", timeout=12000)
-                        except Exception: pass
-                        await self._dismiss_popups(page)
-                    except Exception:
-                        pass
+                buttons = page.get_by_role("button", name=re.compile(pattern, re.I))
+                for button in await buttons.all():
+                    if await button.is_visible() and await button.is_enabled():
+                        await button.click(timeout=4000)
+                        navigated = True
+                        break
 
+            if not allowed_host(page.url, self._allowlist()):
+                raise ValueError("The portal action redirected outside the configured host allow-list.")
+            if navigated:
+                await self._dismiss_popups(page)
             return {
                 "action": action,
                 "url": page.url,
                 "title": await page.title(),
                 "next_step": "form",
+                "navigated": navigated,
             }
 
     async def perform_login(self, workflow_id: str, username: str, password: str, action: str = "login") -> dict[str, Any]:
@@ -656,12 +666,12 @@ class BrowserAutomationAgent:
                 return { hasLogin, hasRegister };
             }""")
 
-            if info["passwordCount"] or re.search(r"\b(sign in|log in|login to continue|user name and password)\b", info["text"], re.I) or auth_info.get("hasLogin"):
+            if info["passwordCount"]:
                 return {"found": False, "login_required": True, "has_form": info["passwordCount"] > 0, "has_login": auth_info.get("hasLogin", False), "has_register": auth_info.get("hasRegister", False), "url": page.url, "title": await page.title()}
             page_title = await page.title()
             if info["visibleInputs"] >= 2 and re.search(r"application|apply|admission|registration|scholarship|service", page_title + " " + info["text"], re.I):
                 return {"found": True, "login_required": False, "has_form": True, "url": page.url, "title": page_title}
-            links = await page.locator("a").evaluate_all("""els => els.map((el,index) => ({index,text:(el.innerText || el.getAttribute('aria-label') || '').trim(),href:el.href || ''})).filter(x => x.text && x.href)""")
+            links = await page.locator("a").evaluate_all("""els => els.filter(el => el.getClientRects().length && getComputedStyle(el).visibility === 'visible').map(el => ({text:(el.innerText || el.getAttribute('aria-label') || '').trim(),href:el.href || ''})).filter(x => x.text && x.href)""")
             goal_terms = [x for x in re.findall(r"[a-z]{4,}", goal.lower()) if x not in {"application", "apply", "portal", "official", "please", "complete", "submit", "online"}]
             scored = []
             for item in links:
@@ -673,38 +683,31 @@ class BrowserAutomationAgent:
                 if re.search(r"apply online|new application|start application|application form|apply now|start fresh", label):
                     score += 7
                 elif re.search(r"existing user|user login|citizen login|applicant login|sign in|log in", label):
-                    score += 6
+                    continue
                 elif re.search(r"application|apply|admission|registration|register|enrol|enroll|start|renewal", label):
                     score += 4
                 if any(term in label or term in href for term in goal_terms):
                     score += 2
                 if urlparse(item["href"]).hostname == urlparse(page.url).hostname:
                     score += 2
-                if score >= 4 and allowed_host(item["href"], self._allowlist()):
+                if score >= 7 and allowed_host(item["href"], self._allowlist()):
                     scored.append((score, item))
             scored.sort(key=lambda x: x[0], reverse=True)
-            if scored:
+            ambiguous = len(scored) > 1 and scored[0][0] == scored[1][0]
+            if scored and not ambiguous:
                 target = scored[0][1]
                 # Navigate directly to an allow-listed HTTPS href so target=_blank does not
                 # silently create a second page that the runtime cannot observe.
                 await page.goto(target["href"], wait_until="domcontentloaded", timeout=45000)
                 if not allowed_host(page.url, self._allowlist()):
                     raise ValueError("The application link redirected outside the configured host allow-list.")
-                is_auth_page = await page.locator("input[type=password]").count() > 0 or bool(re.search(r"\b(login|sign in|user id|enter password)\b", await page.locator("body").inner_text(), re.I))
-                return {"found": True, "login_required": is_auth_page, "has_form": is_auth_page, "url": page.url, "title": await page.title(), "link_text": target["text"]}
-            buttons = await page.locator("button,[role=button]").evaluate_all("""els => els.map((el,index) => ({index,text:(el.innerText || el.getAttribute('aria-label') || '').trim()})).filter(x => x.text)""")
-            button_candidates = [x for x in buttons if re.search(r"apply online|new application|start application|application form|apply now|continue application|user login|sign in|log in|register", x["text"], re.I)]
-            if button_candidates:
-                target_button = button_candidates[0]
-                await page.locator("button,[role=button]").nth(target_button["index"]).click()
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                if not allowed_host(page.url, self._allowlist()):
-                    raise ValueError("The application action navigated outside the configured host allow-list.")
-                return {"found": True, "login_required": False, "url": page.url, "title": await page.title(), "link_text": target_button["text"]}
-            return {"found": False, "login_required": False, "url": page.url, "title": await page.title(), "reason": "No clear application entry link was found."}
+                await self._dismiss_popups(page)
+                is_auth_page = await page.locator("input[type=password]:visible").count() > 0
+                has_form = await page.locator(
+                    'form input:not([type="hidden"]):not([type="submit"]):visible, form select:visible, form textarea:visible'
+                ).count() > 0
+                return {"found": True, "login_required": is_auth_page, "has_form": has_form, "url": page.url, "title": await page.title(), "link_text": target["text"]}
+            return {"found": False, "login_required": False, "url": page.url, "title": await page.title(), "ambiguous": ambiguous, "reason": "No clear application entry link was found."}
 
     async def inspect(self, workflow_id: str) -> dict[str, Any]:
         async with self._lock:
@@ -799,6 +802,18 @@ class BrowserAutomationAgent:
                             skipped.append({"field_index": index, "reason": "No matching dropdown option; choose it manually."})
                             continue
                         await locator.select_option(value=match["value"])
+                    elif meta.get("combo"):
+                        await locator.fill(value)
+                        menu_id = await locator.get_attribute("aria-controls")
+                        if not menu_id or not re.fullmatch(r"[\w:-]+", menu_id):
+                            await locator.press("Escape")
+                            continue
+                        menu = page.locator(f'[id="{menu_id}"]')
+                        options = menu.get_by_role("option", name=value, exact=True)
+                        if await options.count() != 1:
+                            await locator.press("Escape")
+                            continue
+                        await options.click(timeout=3000)
                     elif meta["type"] == "checkbox":
                         if value.strip().lower() in {"true", "yes", "1", "checked"}:
                             await locator.check()
@@ -814,7 +829,13 @@ class BrowserAutomationAgent:
                         await locator.check()
                     else:
                         await locator.fill(value)
-                    if await locator.evaluate("el => el.validity.valid && el.getAttribute('aria-invalid') !== 'true'", timeout=2500):
+                        if meta.get("birth_picker"):
+                            await locator.press("Tab")
+                    updated = await locator.evaluate(FIELD_METADATA, index, timeout=2500)
+                    if (updated["has_value"] and updated["valid"]) or (
+                        meta["type"] == "checkbox" and value.lower() in {"false", "no", "0", "unchecked"}
+                        and updated["valid"] and not updated["has_value"]
+                    ):
                         filled.append({"field_index": index, "field_label": label, "profile_key": mapping.get("profile_key")})
                     else:
                         skipped.append({"field_index": index, "reason": "The portal rejected this value."})
@@ -898,30 +919,14 @@ class BrowserAutomationAgent:
             names = r"log ?in|sign in" if login else r"next|continue|save and continue|proceed|save & next|next step"
             pattern = re.compile(rf"^\s*(?:{names})\s*$", re.I)
             candidates = page.get_by_role("button", name=pattern)
-            if not await candidates.count():
-                candidates = page.locator('input[type="submit"], input[type="button"]')
-            chosen = None
-            for i in range(await candidates.count()):
-                item = candidates.nth(i)
-                try:
-                    if not await item.is_visible():
-                        continue
-                    label = (await item.get_attribute("value")) or (await item.inner_text())
-                    if pattern.fullmatch(label or ""):
-                        chosen = item
-                        break
-                except Exception:
-                    continue
-            if chosen is None:
+            actionable = [item for item in await candidates.all()
+                          if await item.is_visible() and await item.is_enabled()]
+            if len(actionable) != 1:
                 return {"advanced": False, "reason": "No unambiguous Next or Continue button was found."}
             try:
-                await chosen.scroll_into_view_if_needed(timeout=3000)
-                await chosen.click(timeout=6000)
-            except Exception:
-                try:
-                    await chosen.evaluate("el => el.click()")
-                except Exception as exc:
-                    return {"advanced": False, "reason": f"Could not click Next button: {str(exc)[:120]}"}
+                await actionable[0].click(timeout=6000)
+            except Exception as exc:
+                return {"advanced": False, "reason": f"Could not click Next button: {str(exc)[:120]}"}
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=12000)
             except Exception:

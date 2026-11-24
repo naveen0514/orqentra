@@ -80,6 +80,7 @@ const ONBOARDING_STEPS = [
       { key: 'address_line_1', label: 'Address Line 1 / Street', type: 'text', required: true },
       { key: 'address_line_2', label: 'Address Line 2 / Area', type: 'text' },
       { key: 'city', label: 'City / Town', type: 'text', required: true },
+      { key: 'post_office', label: 'Post Office', type: 'text' },
       { key: 'district', label: 'District', type: 'text' },
       { key: 'state', label: 'State / Province', type: 'text', required: true },
       { key: 'postal_code', label: 'PIN / ZIP Code', type: 'text', required: true },

@@ -26,6 +26,10 @@ PORTAL_HINTS = [
     {"keys": ("driving licence", "driving license", "learner licence", "learner license"), "country": "india", "title": "Parivahan — Sarathi Services", "url": "https://sarathi.parivahan.gov.in/", "confidence": 0.95},
 ]
 
+ADDRESS_COMPONENTS = ("address_line_1", "post_office", "district", "postal_code")
+ADDRESS_LABELS = {"address_line_1": "street address", "post_office": "post office",
+                  "district": "district", "postal_code": "PIN code"}
+
 PORTAL_DETAILS = {"login_id", "login_id_same_as_email", "registration_office"}
 
 
@@ -36,7 +40,7 @@ class PortalDiscovery:
 
     async def discover(self, goal: str, service: str) -> list[dict[str, Any]]:
         text = goal.lower()
-        known = [x for x in PORTAL_HINTS if x["country"] == self.country and any(k in text for k in x["keys"])]
+        known = [x for x in PORTAL_HINTS if x["country"] == self.country and any(re.search(rf"\b{re.escape(k)}\b", text) for k in x["keys"])]
         if known:
             return known[:3]
         query = f"official {goal[:150]} application portal {self.country}"
@@ -291,8 +295,11 @@ class AgentRuntime:
             wf["pending_input"] = None; wf["status"] = "running"; self._save(wf)
             self._schedule(wid, self._continue_form(wid))
         elif pending.get("kind") == "document":
-            url = self._extract_url(message)
-            self._say(wid, f"Please upload **{pending.get('label', 'the requested document')}** using the upload area below. {('I can also use this secure document URL: ' + url) if url else ''}")
+            if low == "skip" and pending.get("optional"):
+                wf.setdefault("skipped_optional", []).append(pending["field"])
+                self._resume(wf)
+            else:
+                self._say(wid, f"Please upload **{pending.get('label', 'the requested document')}** using the upload button in chat.")
         elif pending.get("kind") == "manual_action":
             if any(x in low for x in ("ready", "done", "completed", "continue")):
                 wf["pending_input"] = None; wf["status"] = "running"; self._save(wf)
@@ -339,7 +346,7 @@ class AgentRuntime:
                     self._say(wid, "I couldn’t identify a sufficiently reliable official portal from the request. Please paste the official HTTPS application portal link, and I’ll continue.")
                     self._save(wf); return
                 candidate = candidates[0]
-                if candidate.get("confidence", 0) >= 0.94 and candidate.get("source") != "web search":
+                if len(candidates) == 1 and candidate.get("confidence", 0) >= 0.94 and candidate.get("source") != "web search":
                     wf["portal_url"] = candidate["url"]
                     self._step(wf, "portal", "running", f"Matched a known official service portal: {candidate['title']}.")
                     self._say(wid, f"I found the likely official portal: **{candidate['title']}** ([open portal]({candidate['url']})). I’m opening it now.")
@@ -371,13 +378,10 @@ class AgentRuntime:
         try:
             result = await self.browser.open_portal(wid, url)
             wf["portal_url"] = result["url"]
-            navigation = await self.browser.navigate_to_application(wid, wf.get("goal", "application"))
             self._step(wf, "portal", "completed", f"Opened {result['title'] or result['url']} in Chromium.")
             if result.get("popup_dismissed"):
                 self._event(wid, "popup_dismissed", "Dismissed advisory/announcement modal popup")
 
-            # Detect all choices on the portal (Login, Register, Apply, etc.) and ask user to choose
-            choices = [] if navigation.get("has_form") else await self.browser.detect_page_actions(wid)
             goal = wf["goal"]
             register = re.search(r"\b(register|sign up|create)\b.{0,40}\b(account|new user)\b|^register\b", goal, re.I)
             login = re.search(r"\b(log in|login|sign in)\b", goal, re.I)
@@ -387,12 +391,22 @@ class AgentRuntime:
                     requested_action = "register"
                 elif login and not register:
                     requested_action = "login"
+            navigation = {} if requested_action else await self.browser.navigate_to_application(wid, goal)
+            choices = [] if navigation.get("has_form") else await self.browser.detect_page_actions(wid)
             if requested_action and any(choice["action"] == requested_action for choice in choices):
                 await self.browser.navigate_action(wid, requested_action)
                 wf["portal_action"] = requested_action
                 self._save(wf)
                 self._tasks[wid] = asyncio.create_task(self._continue_form(wid))
                 return
+            if not requested_action and not navigation.get("ambiguous") and any(
+                choice["action"] == "apply" for choice in choices
+            ):
+                result = await self.browser.navigate_action(wid, "apply")
+                if result.get("navigated"):
+                    self._save(wf)
+                    self._tasks[wid] = asyncio.create_task(self._continue_form(wid))
+                    return
             if not choices:
                 if requested_action:
                     wf["portal_action"] = requested_action
@@ -445,13 +459,53 @@ class AgentRuntime:
 
     @staticmethod
     def _form_value(field: dict, value: str) -> str:
-        if field.get("type") == "date":
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        if field.get("digits"):
+            digits = re.sub(r"[^0-9]", "", value)
+            length = field["digits"]
+            if length == 10 and len(digits) == 12 and digits.startswith("91"):
+                digits = digits[2:]
+            elif length == 10 and len(digits) == 14 and digits.startswith("0091"):
+                digits = digits[4:]
+            elif value.lstrip().startswith("+"):
+                return ""
+            if re.fullmatch(r"[+0-9 ()-]+", value) and len(digits) == length:
+                return digits
+            return ""
+        if field.get("type") == "date" or field.get("birth_picker"):
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y"):
                 try:
-                    return datetime.strptime(value, fmt).date().isoformat()
+                    date = datetime.strptime(value, fmt).date()
+                    return date.strftime("%d %b %Y") if field.get("birth_picker") else date.isoformat()
                 except ValueError:
                     continue
+            return ""
         return value
+
+    @classmethod
+    def _address_key(cls, field: dict) -> str | None:
+        label = _clean(field_label(field))
+        key = cls._key_from_label(label)
+        if key == "current_address" or label in {"address", "mailing address", "contact address"}:
+            return "current_address"
+        return None
+
+    @staticmethod
+    def _address_details(profile: dict) -> tuple[str, list[str]]:
+        explicit = profile.get("current_address")
+        base = explicit or profile.get("address_line_1")
+        missing = [key for key in ADDRESS_COMPONENTS if not profile.get(key)
+                   and not (key == "address_line_1" and explicit)]
+        if explicit:
+            missing = [key for key in missing if not re.search(
+                rf"\b{ADDRESS_LABELS[key]}\b", explicit, re.I)]
+            if re.search(r"\b[1-9][0-9]{5}\b", explicit) and "postal_code" in missing:
+                missing.remove("postal_code")
+        parts = [base]
+        for key in ("address_line_2", "post_office", "city", "district", "state", "postal_code"):
+            value = profile.get(key)
+            if value and not any(f" {_clean(value)} " in f" {_clean(part)} " for part in parts if part):
+                parts.append(value)
+        return ", ".join(part for part in parts if part), missing
 
     async def _fill_saved_values(self, wid: str, inspected: dict, profile: dict) -> tuple[dict, dict]:
         url = inspected["url"]
@@ -463,10 +517,17 @@ class AgentRuntime:
             empty = {int(field["index"]): field for field in fields
                      if not (field.get("has_value") and field.get("valid", True))
                      and (field.get("type") != "radio" or self._radio_group(field) not in selected_groups)}
-            mappings = [self._field_mapping(
-                empty[item["field_index"]], url, profile_key=item["profile_key"],
-                value=self._form_value(empty[item["field_index"]], item["value"]),
-            ) for item in suggest_field_mappings(list(empty.values()), profile) if item["confidence"] >= 0.88]
+            address, missing_address = self._address_details(profile)
+            mappings = []
+            for item in suggest_field_mappings(list(empty.values()), {**profile, "current_address": address}):
+                if item["confidence"] < 0.88:
+                    continue
+                field = empty[item["field_index"]]
+                if self._address_key(field) and missing_address:
+                    continue
+                value = self._form_value(field, address if self._address_key(field) else item["value"])
+                if value:
+                    mappings.append(self._field_mapping(field, url, profile_key=item["profile_key"], value=value))
             if not mappings:
                 break
             result = await self.browser.fill(wid, mappings)
@@ -478,9 +539,11 @@ class AgentRuntime:
             self._event(wid, "fields_auto_filled", f"Filled {len(filled)} field(s) from your saved profile")
         return inspected, filled
 
-    def _ask_field(self, wf: dict, url: str, field: dict, fields: list[dict], *, remember_password: bool = False):
+    def _ask_field(self, wf: dict, url: str, field: dict, fields: list[dict], *, remember_password: bool = False, address_component: str | None = None):
         label = field.get("group_label") if field.get("type") == "radio" else None
         label = label or field_label(field)
+        if address_component:
+            label = ADDRESS_LABELS[address_component]
         secret = field.get("type") == "password"
         options = field.get("options") or []
         if field.get("type") == "radio":
@@ -489,13 +552,17 @@ class AgentRuntime:
             options = [{"label": "Yes"}, {"label": "No"}]
         wf["pending_input"] = {"kind": "password" if secret else "detail", "id": uuid.uuid4().hex,
                                "field": self._field_mapping(field, url), "label": label,
-                               "key": self._key_from_label(label),
+                               "key": address_component or self._field_key(field, label),
+                               "address_component": address_component,
+                               "optional": not field.get("required") and not secret,
                                "options": [str(item.get("label") or item.get("value")) for item in options],
                                "remember": remember_password, "portal": portal_origin(url)}
         wf["status"] = "waiting_user"
         self._step(wf, "requirements", "waiting", f"Waiting for {label}.")
         instructions = ("Use the masked password box in this chat." if secret else
                         "Choose an option below or reply with your choice." if options else "Reply with the value here.")
+        if wf["pending_input"]["optional"]:
+            instructions += " You can reply **skip** to leave it blank."
         self._say(wf["id"], f"I need **{label}**. {instructions}", "password_request" if secret else "detail_request")
 
     async def _answer_detail(self, wid: str, question_id: str, message: str) -> dict:
@@ -514,9 +581,17 @@ class AgentRuntime:
                 return {"workflow": wf}
             key = pending["key"]
             answer = self._parse_details(message, [key]).get(key, "").strip()
+            if answer.lower() == "skip" and pending.get("optional"):
+                wf.setdefault("skipped_optional", []).append(target)
+                self._resume(wf)
+                return {"workflow": wf}
             if not answer or answer.lower() in {"skip", "i don't know", "not available"}:
                 raise ValueError("The portal requires this field. Enter a value to continue.")
+            component = pending.get("address_component")
             value = self._form_value(field, answer)
+            if not value:
+                hint = f" Enter all {field['digits']} digits." if field.get("digits") else " Check the requested format."
+                raise ValueError(f"The portal needs a valid {pending['label']}.{hint}")
             if field.get("type") == "radio":
                 option = next((item for item in self._radio_options(field, fields)
                                if _clean(item.get("option_label") or field_label(item)) == _clean(answer)), None)
@@ -525,9 +600,12 @@ class AgentRuntime:
                 target = self._field_mapping(option, inspected["url"])
                 answer = option.get("option_label") or field_label(option)
                 value = "true"
-            result = await self.browser.fill(wid, [{**target, "value": value, "profile_key": key}])
-            if not result.get("filled"):
-                raise ValueError("The portal didn’t accept that value. Check the field format or choose an available option.")
+            if not component:
+                result = await self.browser.fill(wid, [{**target, "value": value, "profile_key": key}])
+                if not result.get("filled"):
+                    raise ValueError("The portal didn’t accept that value. Check the field format or choose an available option.")
+            if field.get("type") == "checkbox" and _clean(answer) in {"no", "false", "0", "unchecked"}:
+                wf.setdefault("skipped_optional", []).append(target)
             uid = wf.get("user_id")
             origin = portal_origin(inspected["url"])
             if uid and key in ALIASES and key not in PORTAL_DETAILS:
@@ -537,7 +615,8 @@ class AgentRuntime:
             elif not uid:
                 self.store.save_profile_value(key, answer, "user-chat")
             self.store.add_message(wid, "user", answer)
-            self._say(wid, f"I filled **{pending['label']}** and will check the remaining fields.")
+            action = "Saved" if component else "Filled"
+            self._say(wid, f"{action} **{pending['label']}**. I’ll check the remaining fields.")
             self._resume(wf)
             return {"workflow": wf}
 
@@ -577,6 +656,28 @@ class AgentRuntime:
         self._say(wf["id"], "The portal confirmed your registration. Check your email for any activation instructions.")
         self._event(wf["id"], "registration_confirmed", "The portal displayed a registration confirmation", {"url": url})
 
+    async def _request_document(self, wf: dict, url: str, field: dict) -> bool:
+        wid = wf["id"]
+        label = field_label(field)
+        mapping = self._field_mapping(field, url)
+        docs = self.store.get_documents(wf.get("user_id", ""), include_text=False)
+        match = self._match_document(label, docs)
+        if match:
+            try:
+                await self.browser.upload_file(wid, field["index"], match["path"])
+                self._event(wid, "document_attached", f"Attached {match['filename']} to {label}")
+                return False
+            except Exception:
+                self._event(wid, "document_upload_skipped", "A saved document could not be attached")
+        optional = not field.get("required")
+        wf["status"] = "waiting_user"
+        wf["pending_input"] = {"kind": "document", "label": label, "field_index": field["index"],
+                               "field": mapping, "optional": optional}
+        self._step(wf, "requirements", "waiting", f"Waiting for {label}.")
+        skip = " Reply **skip** to leave it blank." if optional else ""
+        self._say(wid, f"Please upload **{label}** in this chat so I can attach it and continue.{skip}", "document_request")
+        return True
+
     async def _continue_form(self, wid: str, depth: int = 0):
         if depth > 12:
             await self._wait_manual(wid, "I’ve processed 12 application pages in this run. Please review the current page and type **ready** to continue.")
@@ -590,7 +691,8 @@ class AgentRuntime:
                 if wf.get("registration_page") and inspected.get("registration_confirmed"):
                     self._registration_completed(wf, url)
                     return
-                inspected, filled = await self._fill_saved_values(wid, inspected, self._profile_for_page(wf, url))
+                profile = self._profile_for_page(wf, url)
+                inspected, filled = await self._fill_saved_values(wid, inspected, profile)
                 if inspected["url"] != url:
                     self._tasks[wid] = asyncio.create_task(self._continue_form(wid, depth + 1))
                     return
@@ -623,7 +725,8 @@ class AgentRuntime:
                 can_remember = bool(uid and origin and auth_form)
                 portal_password = (self.store.get_portal_values(uid, origin, password=True).get("password")
                                    if can_remember else None)
-                docs = None
+                optional_fields = []
+                _, missing_address = self._address_details(profile)
 
                 for field in visible:
                     index = int(field["index"])
@@ -641,26 +744,25 @@ class AgentRuntime:
                             continue
                         self._ask_field(wf, url, field, fields, remember_password=can_remember and credential_field)
                         return
-                    if field.get("sensitive") or not field.get("required"):
+                    if field.get("sensitive"):
                         continue
-                    if typ == "file":
-                        label = field_label(field)
-                        if docs is None:
-                            docs = self.store.get_documents(uid, include_text=False)
-                        match = self._match_document(label, docs)
-                        if match:
-                            try:
-                                await self.browser.upload_file(wid, index, match["path"])
-                                self._event(wid, "document_attached", f"Attached {match['filename']} to {label}")
-                                continue
-                            except Exception:
-                                self._event(wid, "document_upload_skipped", "A saved document could not be attached")
-                        wf["status"] = "waiting_user"
-                        wf["pending_input"] = {"kind": "document", "label": label, "field_index": index,
-                                               "field": self._field_mapping(field, url)}
-                        self._step(wf, "requirements", "waiting", f"Waiting for {label}.")
-                        self._say(wid, f"Please upload **{label}** in this chat so I can attach it and continue.", "document_request")
+                    optional = not field.get("required")
+                    if optional:
+                        key = self._field_key(field, field_label(field))
+                        if not field.get("form_action") or self._field_mapping(field, url) in wf.get("skipped_optional", []):
+                            continue
+                        if typ in ALLOWED_INPUT_TYPES and (key in ALIASES or typ == "checkbox"):
+                            optional_fields.append(field)
+                        elif typ == "file":
+                            optional_fields.append(field)
+                        continue
+                    if self._address_key(field) and missing_address:
+                        self._ask_field(wf, url, field, fields, address_component=missing_address[0])
                         return
+                    if typ == "file":
+                        if await self._request_document(wf, url, field):
+                            return
+                        continue
                     if typ in ALLOWED_INPUT_TYPES:
                         self._ask_field(wf, url, field, fields)
                         return
@@ -691,6 +793,15 @@ class AgentRuntime:
                     wf["pending_input"] = {"kind": "manual_verification"}
                     self._step(wf, "verification", "waiting", f"{label} requires direct review.")
                     self._say(wid, f"Review **{label}** on the portal, then reply **ready** in chat.", "manual_verification")
+                    return
+
+                for field in optional_fields:
+                    if field.get("type") == "file":
+                        if await self._request_document(wf, url, field):
+                            return
+                        continue
+                    component = missing_address[0] if self._address_key(field) and missing_address else None
+                    self._ask_field(wf, url, field, fields, address_component=component)
                     return
 
                 self._step(wf, "requirements", "completed", f"Inspected {len(fields)} visible fields and found no unmatched required ordinary fields or missing required documents.")
@@ -753,7 +864,7 @@ class AgentRuntime:
                 if submit_result.get("submitted"):
                     wf["status"] = "completed"; wf["pending_input"] = None
                     self._step(wf, "form", "completed", "Application fields completed.")
-                    self._step(wf, "verification", "completed", "Portal accepted the final action; confirmation content captured for review.")
+                    self._step(wf, "verification", "completed", "Captured the portal response for your review.")
                     self._step(wf, "submission", "completed", "Final submission control was activated; check the official portal acknowledgement.")
                     self._say(wid, "The application submission control was activated. Please check the official portal confirmation shown in the browser. I’ve captured the visible confirmation text for your records. If the portal issues an acknowledgement number or receipt, upload/download it and I’ll add it to your document vault.")
                     self._event(wid, "application_submitted", "Final application submit control was clicked", {"url": submit_result.get("url"), "confirmation_preview": submit_result.get("confirmation_text", "")[:500]})
@@ -917,9 +1028,13 @@ class AgentRuntime:
         match = re.search(r"https://[^\s<>]+", text)
         return match.group(0).rstrip(".,);]") if match else None
 
+    @classmethod
+    def _field_key(cls, field: dict, label: str) -> str:
+        return cls._address_key(field) or cls._key_from_label(label)
+
     @staticmethod
     def _key_from_label(label: str) -> str:
-        clean = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+        clean = _clean(label)
         # Prefer the longest alias so "father name" cannot collapse to generic "name".
         candidates = []
         for key, aliases in ALIASES.items():
@@ -970,7 +1085,7 @@ class AgentRuntime:
                     continue
                 label, value = part.split(":", 1)
                 key = AgentRuntime._key_from_label(label)
-                if key in {"full_name", "given_name", "surname", "date_of_birth", "gender", "nationality", "marital_status", "email", "phone", "address_line_1", "address_line_2", "city", "district", "state", "postal_code", "country", "father_name", "mother_name", "occupation", "annual_income", "education_level", "institution", "course", "graduation_year", "grade", "employer", "years_experience", "organization", "registration_number", "passport_number", "visa_type", "travel_purpose"} and value.strip():
+                if key in {"post_office", "current_address", "full_name", "given_name", "surname", "date_of_birth", "gender", "nationality", "marital_status", "email", "phone", "address_line_1", "address_line_2", "city", "district", "state", "postal_code", "country", "father_name", "mother_name", "occupation", "annual_income", "education_level", "institution", "course", "graduation_year", "grade", "employer", "years_experience", "organization", "registration_number", "passport_number", "visa_type", "travel_purpose"} and value.strip():
                     facts[key] = value.strip()
         return facts
 

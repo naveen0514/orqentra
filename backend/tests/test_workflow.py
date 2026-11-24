@@ -170,3 +170,20 @@ def test_credentials_are_not_persisted_in_chat_or_events(tmp_path):
     events = store.get_events("wf-cred")
     assert "SecretPass123!" not in str(events)
 
+
+
+def test_phone_and_address_use_portal_format_and_saved_components():
+    from app.agent_runtime import AgentRuntime
+
+    field = {"type": "text", "digits": 10}
+    assert AgentRuntime._form_value(field, "+91 98765 43210") == "9876543210"
+    assert AgentRuntime._form_value(field, "+91 98765432") == ""
+    assert AgentRuntime._form_value({"type": "tel"}, "+91 98765 43210") == "+91 98765 43210"
+
+    profile = {"address_line_1": "42 Test Street", "postal_code": "625001"}
+    _, missing = AgentRuntime._address_details(profile)
+    assert missing == ["post_office", "district"]
+    profile.update(post_office="Test Post", district="Test District")
+    address, missing = AgentRuntime._address_details(profile)
+    assert not missing
+    assert address == "42 Test Street, Test Post, Test District, 625001"
